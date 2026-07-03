@@ -1,0 +1,183 @@
+name: Release binaries
+
+# Publishes the m1-mcp CLI as prebuilt binaries (Linux/macOS/Windows) on a
+# GitHub Release named after the crate version. A release is cut automatically
+# whenever the Cargo.toml version changes (i.e. no release tag exists for it
+# yet); can also be run manually.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize release runs — never cancel one mid-publish; a queued run is
+# idempotent for an already-released version (m1-tools#27).
+concurrency:
+  group: ${{ github.workflow }}-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      should_release: ${{ steps.v.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Release when the tag is absent OR the existing release is missing any
+          # of the per-platform binaries. Keying only on "release exists" meant a
+          # release tagged before its binaries uploaded (or created by hand) could
+          # never self-heal — the consumers would be left with a 404.
+          required="m1-mcp-x86_64-unknown-linux-gnu m1-mcp-aarch64-apple-darwin m1-mcp-x86_64-pc-windows-msvc.exe"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            assets=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+            missing=
+            for a in $required; do
+              grep -qxF "$a" <<<"$assets" || missing="$missing $a"
+            done
+            if [ -n "$missing" ]; then
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "Release v$VERSION exists but is missing binaries:$missing — will (re)build and upload."
+            else
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "Release v$VERSION already has all binaries — nothing to do."
+            fi
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Will release v$VERSION."
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          # Intel macOS (x86_64-apple-darwin) is intentionally omitted: GitHub no
+          # longer reliably allocates Intel-Mac runners, which stalls the release.
+          # Intel-Mac users build from source.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --bin m1-mcp
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/m1-mcp${{ matrix.ext }}" \
+             "out/m1-mcp-${{ matrix.target }}${{ matrix.ext }}"
+      - name: Ad-hoc re-sign the macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The linker's ad-hoc signature on the released binary does not validate
+          # on user machines — AMFI kills it at exec (SIGKILL, "Code Signature
+          # Invalid"). A fresh ad-hoc re-sign writes a valid signature over the
+          # final bytes; the artifact zip round-trip preserves it to the user.
+          # (nvim-m1#15)
+          codesign --force --sign - "out/m1-mcp-${{ matrix.target }}${{ matrix.ext }}"
+          codesign --verify --verbose "out/m1-mcp-${{ matrix.target }}${{ matrix.ext }}"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: out/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin-${{ matrix.target }}
+          path: out/*
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish release v${{ needs.check.outputs.version }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.check.outputs.version }}
+        run: |
+          # Checksum manifest covering every released binary; the release notes
+          # explain how to verify it (and the build provenance) after download.
+          (cd out && sha256sum * > SHA256SUMS)
+
+          # Release body: auto-generated "What's Changed" (PR list + full
+          # changelog link) followed by install + verification instructions.
+          # PR titles may contain backticks, so the generated half must never
+          # pass through an unquoted heredoc; the static half is a quoted
+          # heredoc with placeholders substituted afterwards.
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" \
+            -q .body > body.md || echo "_Generated notes unavailable._" > body.md
+          cat >> body.md <<'NOTES'
+
+          ## Install
+
+          Prebuilt binaries of the **m1-mcp** Model Context Protocol server for the MoTeC M1 toolchain. Manual install:
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 | [`m1-mcp-x86_64-unknown-linux-gnu`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-mcp-x86_64-unknown-linux-gnu) |
+          | macOS Apple Silicon | [`m1-mcp-aarch64-apple-darwin`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-mcp-aarch64-apple-darwin) |
+          | Windows x86_64 | [`m1-mcp-x86_64-pc-windows-msvc.exe`](https://github.com/{{REPO}}/releases/download/{{TAG}}/m1-mcp-x86_64-pc-windows-msvc.exe) |
+
+          Download the binary for your platform, rename it to `m1-mcp` (`m1-mcp.exe` on Windows), mark it executable (`chmod +x m1-mcp`), and move it onto your `PATH`. On macOS, clear the download quarantine first: `xattr -d com.apple.quarantine m1-mcp`.
+
+          Or build from source on any platform (incl. Intel macOS):
+
+          ```sh
+          cargo install --git https://github.com/{{REPO}} --tag {{TAG}}
+          ```
+
+          ## Verify the download
+
+          `SHA256SUMS` covers every binary, and each binary carries GitHub build provenance:
+
+          ```sh
+          sha256sum --check --ignore-missing SHA256SUMS
+          gh attestation verify m1-mcp-x86_64-unknown-linux-gnu --repo {{REPO}}
+          ```
+          NOTES
+          sed -i "s|{{REPO}}|$GITHUB_REPOSITORY|g; s|{{TAG}}|$TAG|g" body.md
+
+          # Create the release if absent, otherwise upload the assets to the
+          # existing one (--clobber overwrites any partial uploads). The body is
+          # only set on create, so a self-heal never overwrites edited notes.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" out/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "m1-mcp $TAG" \
+              --notes-file body.md
+          fi
