@@ -506,7 +506,16 @@ version = "0.14.1"
 source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.14.1#7c265135542617ef2bf45515181fe41f3e6a0f76"
 dependencies = [
  "tree-sitter",
- "tree-sitter-m1",
+ "tree-sitter-m1 0.7.1",
+]
+
+[[package]]
+name = "m1-core"
+version = "0.15.0"
+source = "git+https://github.com/C-Nucifora/m1-core.git?tag=v0.15.0#1fe6f9ad4d6a0479c5cfeb770270fab0f89e8f89"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-m1 0.8.0",
 ]
 
 [[package]]
@@ -516,8 +525,8 @@ source = "git+https://github.com/C-Nucifora/m1-fmt.git?tag=v0.16.1#b43ea7da6f167
 dependencies = [
  "clap",
  "libc",
- "m1-core",
- "m1-workspace",
+ "m1-core 0.14.1",
+ "m1-workspace 0.12.0",
  "rayon",
  "toml",
 ]
@@ -529,8 +538,8 @@ source = "git+https://github.com/C-Nucifora/m1-lint.git?tag=v0.23.0#b3dc2df5a091
 dependencies = [
  "clap",
  "glob",
- "m1-core",
- "m1-workspace",
+ "m1-core 0.14.1",
+ "m1-workspace 0.12.0",
  "rayon",
  "serde_json",
  "toml",
@@ -541,11 +550,11 @@ name = "m1-mcp"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "m1-core",
+ "m1-core 0.15.0",
  "m1-fmt",
  "m1-lint",
  "m1-typecheck",
- "m1-workspace",
+ "m1-workspace 0.13.0",
  "rmcp",
  "schemars",
  "serde",
@@ -562,8 +571,8 @@ version = "0.43.0"
 source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.43.0#6834fd307c7d2c3e9f615b6f0fe09b9b2e56afbb"
 dependencies = [
  "clap",
- "m1-core",
- "m1-workspace",
+ "m1-core 0.14.1",
+ "m1-workspace 0.12.0",
  "roxmltree",
  "serde",
  "serde_json",
@@ -574,6 +583,16 @@ dependencies = [
 name = "m1-workspace"
 version = "0.12.0"
 source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.12.0#3612f48925dc57960deb9325ec82494e1d16cfc1"
+dependencies = [
+ "serde",
+ "serde_ignored",
+ "toml",
+]
+
+[[package]]
+name = "m1-workspace"
+version = "0.13.0"
+source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.13.0#cf1b5b862d255cc4ecb89a7b708016bd9a9f33db"
 dependencies = [
  "serde",
  "serde_ignored",
@@ -1169,6 +1188,15 @@ checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 name = "tree-sitter-m1"
 version = "0.7.1"
 source = "git+https://github.com/C-Nucifora/tree-sitter-m1.git?tag=v0.7.1#7d31d2415934d0546c86765b1c38a033e52653ae"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-m1"
+version = "0.8.0"
+source = "git+https://github.com/C-Nucifora/tree-sitter-m1.git?tag=v0.8.0#e9dbd45be91c0771105637924a2c5c87ae17c1fb"
 dependencies = [
  "cc",
  "tree-sitter-language",

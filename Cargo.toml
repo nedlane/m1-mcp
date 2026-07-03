@@ -20,11 +20,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # M1 toolchain library crates, pinned to released git tags (same as the rest of
 # the stack — never path deps). These are called in-process; there is no PATH
 # dependency on installed CLIs.
-m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.14.1" }
+m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
 m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.43.0" }
 m1-lint = { git = "https://github.com/C-Nucifora/m1-lint.git", tag = "v0.23.0" }
 m1-fmt = { git = "https://github.com/C-Nucifora/m1-fmt.git", tag = "v0.16.1" }
-m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.12.0" }
+m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
 
 [dev-dependencies]
 tempfile = "3"
