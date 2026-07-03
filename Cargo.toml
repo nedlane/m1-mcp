@@ -1,6 +1,6 @@
 [package]
 name = "m1-mcp"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Model Context Protocol server exposing the MoTeC M1 toolchain to AI agents"
 license = "GPL-3.0-or-later"

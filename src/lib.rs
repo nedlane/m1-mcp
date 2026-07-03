@@ -8,6 +8,7 @@
 
 pub mod analyze;
 pub mod doc;
+pub mod loader;
 pub mod server;
 pub mod symbols;
 

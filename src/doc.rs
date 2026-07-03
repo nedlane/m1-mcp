@@ -101,10 +101,31 @@ fn name_rank(haystack: &str, needle: &str) -> Option<u8> {
     }
 }
 
-/// A scored entry used while ranking a search.
-struct Scored {
-    rank: u8,
+/// A catalogue entry with its match keys, materialised once (see [`catalog`]).
+struct CatalogEntry {
+    leaf: String,
+    qualified: String,
     entry: DocEntry,
+}
+
+/// The whole intrinsics catalogue as searchable [`CatalogEntry`]s, built once
+/// and cached. Previously every `search`/`lookup` re-walked the intrinsics and
+/// re-materialised all ~1500 `DocEntry` values only to discard them; now a
+/// query iterates the cache and clones only the entries it returns.
+fn catalog() -> &'static [CatalogEntry] {
+    use std::sync::OnceLock;
+    static CATALOG: OnceLock<Vec<CatalogEntry>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut v = Vec::new();
+        each_entry(intrinsics::get(), |leaf, qualified, entry| {
+            v.push(CatalogEntry {
+                leaf: leaf.to_string(),
+                qualified: qualified.to_string(),
+                entry,
+            });
+        });
+        v
+    })
 }
 
 /// Walk the whole catalogue, yielding every entry paired with its owning names
@@ -214,34 +235,27 @@ fn each_entry(intr: &'static Intrinsics, mut f: impl FnMut(&str, &str, DocEntry)
 /// qualified name, or (weakest) its documentation. Name matches outrank doc
 /// matches; exact/prefix/substring ties break by name.
 pub fn search(query: &str, limit: usize) -> Vec<DocEntry> {
-    let intr = intrinsics::get();
-    let mut scored: Vec<Scored> = Vec::new();
-    each_entry(intr, |leaf, qualified, entry| {
+    let lower = query.to_ascii_lowercase();
+    let mut scored: Vec<(u8, &CatalogEntry)> = Vec::new();
+    for c in catalog() {
         // Rank by the strongest of leaf-name / qualified-name / doc match.
-        let name_hit = name_rank(leaf, query)
+        let name_hit = name_rank(&c.leaf, query)
             .into_iter()
-            .chain(name_rank(qualified, query))
+            .chain(name_rank(&c.qualified, query))
             .min();
         let rank = match name_hit {
             Some(r) => r,
-            None if entry
-                .doc
-                .to_ascii_lowercase()
-                .contains(&query.to_ascii_lowercase()) =>
-            {
-                3
-            }
-            None => return,
+            None if c.entry.doc.to_ascii_lowercase().contains(&lower) => 3,
+            None => continue,
         };
-        scored.push(Scored { rank, entry });
-    });
+        scored.push((rank, c));
+    }
     scored.sort_by(|a, b| {
-        a.rank
-            .cmp(&b.rank)
-            .then_with(|| a.entry.name.cmp(&b.entry.name))
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.entry.name.cmp(&b.1.entry.name))
     });
     scored.truncate(limit);
-    scored.into_iter().map(|s| s.entry).collect()
+    scored.into_iter().map(|(_, c)| c.entry.clone()).collect()
 }
 
 /// Full detail for an exact catalogue name. Accepts a library function
@@ -250,28 +264,24 @@ pub fn search(query: &str, limit: usize) -> Vec<DocEntry> {
 /// every entry whose leaf or qualified name equals `name` (case-insensitive),
 /// so an overloaded function yields all its signatures.
 pub fn lookup(name: &str) -> Vec<DocEntry> {
-    let intr = intrinsics::get();
-    let want = name.to_ascii_lowercase();
-    let mut out = Vec::new();
-
     // Exact enum-type lookup expands to the type entry plus every member.
-    if let Some(en) = intr
+    if let Some(en) = intrinsics::get()
         .enums
         .iter()
         .find(|e| e.name.eq_ignore_ascii_case(name))
     {
-        each_entry(intr, |_, _, entry| {
-            if entry.parent.as_deref() == Some(en.name.as_str()) || entry.name == en.name {
-                out.push(entry);
-            }
-        });
-        return out;
+        return catalog()
+            .iter()
+            .filter(|c| {
+                c.entry.parent.as_deref() == Some(en.name.as_str()) || c.entry.name == en.name
+            })
+            .map(|c| c.entry.clone())
+            .collect();
     }
 
-    each_entry(intr, |leaf, qualified, entry| {
-        if leaf.to_ascii_lowercase() == want || qualified.to_ascii_lowercase() == want {
-            out.push(entry);
-        }
-    });
-    out
+    catalog()
+        .iter()
+        .filter(|c| c.leaf.eq_ignore_ascii_case(name) || c.qualified.eq_ignore_ascii_case(name))
+        .map(|c| c.entry.clone())
+        .collect()
 }
