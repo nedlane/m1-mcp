@@ -129,3 +129,36 @@ fn analyze_errors_on_missing_input() {
     let err = analyze::lint(&Input::Path("/no/such/file.m1scr".into()));
     assert!(err.is_err(), "unreadable path should error cleanly");
 }
+
+// ---- config discovery (audit: format/lint honour project config) ----
+
+#[test]
+fn format_reads_brace_style_from_project_config() {
+    let dir = tempfile::tempdir().unwrap();
+    // A project that pins K&R braces via the unified config.
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        "[format]\nbrace_style = \"kr\"\n",
+    )
+    .unwrap();
+    // An Allman-braced script committed in that project.
+    let scr = dir.path().join("x.m1scr");
+    let allman = "if (A)\n{\n\tValue = 1;\n}\n";
+    std::fs::write(&scr, allman).unwrap();
+
+    // Via the file path, config is discovered, so the Allman source is
+    // reformatted toward the project's K&R (brace joined onto the control line).
+    let by_path = analyze::format(&Input::Path(scr), false).unwrap();
+    let out = by_path.formatted.unwrap();
+    assert!(
+        out.contains(") {"),
+        "expected K&R brace from config, got:\n{out}"
+    );
+
+    // The identical source formatted inline (no config) keeps Allman.
+    let inline = analyze::format(&Input::Inline(allman.to_string()), false).unwrap();
+    assert!(
+        !inline.formatted.unwrap().contains(") {"),
+        "inline format must use the default Allman, not the project's kr"
+    );
+}

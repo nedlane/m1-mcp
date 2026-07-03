@@ -4,7 +4,6 @@
 
 use std::path::Path;
 
-use m1_typecheck::project::Project;
 use m1_typecheck::symbols::SymbolKind;
 use m1_typecheck::types::ValueType;
 use schemars::JsonSchema;
@@ -70,8 +69,9 @@ pub fn list(
     filter: Option<&str>,
     limit: usize,
 ) -> Result<SymbolsOutcome, String> {
-    let project =
-        Project::load(project_path).map_err(|e| format!("failed to load project: {e}"))?;
+    // Load the project fully (parameters.m1cfg + .m1dbc), so parameter types/
+    // units and CAN signals are populated rather than Unknown/absent.
+    let project = crate::loader::load_project_full(project_path)?;
     let table = project.symbols();
     let total = table.len();
 
