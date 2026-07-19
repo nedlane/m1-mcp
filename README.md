@@ -25,6 +25,30 @@ The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary
 MoTeC M1 Development Manual.
 
+## Scope and limits
+
+`m1-mcp` is an **analysis and format bridge** — it lets an agent look up M1
+semantics and run the read-only analysers (`m1_doc_search`, `m1_doc_lookup`,
+`m1_typecheck`, `m1_lint`, `m1_format`, `m1_symbols`) over the code it writes.
+It is **not** full toolchain parity: it does not evaluate M1 scripts, does not
+mutate projects or write files back, and does not generate docs or
+visualisations. Use the individual CLIs (or the LSP/editor integrations) for
+those.
+
+Because the server speaks MCP over **stdio** on a single process, every request
+is bounded so no one call can monopolise it:
+
+- **Inline `source` and file reads** are capped at **2 MiB** per request; a
+  larger payload (or a `path` to a larger file, rejected on its size before it
+  is read) returns a structured error naming the limit.
+- **Project-wide operations** (`m1_typecheck` given a `project`, and
+  `m1_symbols`) walk at most **2000** `.m1scr` files; a larger project tree is
+  rejected before it is loaded.
+
+The limits are compile-time constants (see `src/limits.rs`), sized well above
+any realistic interactive request — a project that hits them should be run
+through the CLI directly.
+
 ## Install
 
 Download the binary for your platform from the

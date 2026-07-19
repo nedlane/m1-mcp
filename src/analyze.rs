@@ -16,7 +16,7 @@ use m1_typecheck::diagnostics::TypeDiagnostic;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use crate::loader;
+use crate::{limits, loader};
 
 /// A single diagnostic in agent-friendly form (1-based line/column).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -57,12 +57,41 @@ pub enum Input {
 
 impl Input {
     /// Resolve the source text and the script path (if any) for the analysers.
-    fn resolve(&self) -> std::io::Result<(String, Option<&Path>)> {
+    ///
+    /// Both inline source and a file's contents are held to the per-request
+    /// size cap ([`limits::MAX_REQUEST_SOURCE_BYTES`]); a file's size is checked
+    /// (cheap metadata read) *before* its bytes are read, so an oversized file
+    /// is rejected without being loaded into memory.
+    fn resolve(&self) -> Result<(String, Option<&Path>), String> {
         match self {
-            Input::Inline(s) => Ok((s.clone(), None)),
-            Input::Path(p) => Ok((m1_workspace::read_text(p)?, Some(p.as_path()))),
+            Input::Inline(s) => {
+                let len = s.len() as u64;
+                if len > limits::MAX_REQUEST_SOURCE_BYTES {
+                    return Err(over_limit_msg("inline `source`", len));
+                }
+                Ok((s.clone(), None))
+            }
+            Input::Path(p) => {
+                let meta = std::fs::metadata(p)
+                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                if meta.len() > limits::MAX_REQUEST_SOURCE_BYTES {
+                    return Err(over_limit_msg(&format!("file {}", p.display()), meta.len()));
+                }
+                let text = m1_workspace::read_text(p).map_err(|e| e.to_string())?;
+                Ok((text, Some(p.as_path())))
+            }
         }
     }
+}
+
+/// A uniform "too big" error naming the offending input, its size, and the cap.
+fn over_limit_msg(what: &str, size: u64) -> String {
+    format!(
+        "{what} is {size} bytes, which exceeds the {} byte ({} MiB) per-request limit; \
+         analyse a smaller snippet or split the file",
+        limits::MAX_REQUEST_SOURCE_BYTES,
+        limits::MAX_REQUEST_SOURCE_BYTES / (1024 * 1024),
+    )
 }
 
 /// The outcome of type-checking one script.
@@ -80,7 +109,14 @@ pub struct TypecheckOutcome {
 /// so cross-script and reference-keyword resolution runs; otherwise the script
 /// is checked standalone.
 pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<TypecheckOutcome, String> {
-    let (source, script_path) = input.resolve().map_err(|e| e.to_string())?;
+    let (source, script_path) = input.resolve()?;
+
+    // Bound the whole-project work before loading anything: refuse a project
+    // whose tree carries more than `MAX_PROJECT_SCRIPTS` scripts (fail fast, on
+    // a directory walk only — see `loader::check_project_script_budget`).
+    if let Some(pp) = project_path {
+        loader::check_project_script_budget(pp)?;
+    }
 
     // Load the project fully (m1cfg + .m1dbc), not a bare `Project::load`.
     let mut project = match project_path {
@@ -171,7 +207,7 @@ pub struct LintOutcome {
 /// directory so the active rule set and thresholds match the project's CLI/CI;
 /// inline source falls back to the default rule set.
 pub fn lint(input: &Input) -> Result<LintOutcome, String> {
-    let (source, path) = input.resolve().map_err(|e| e.to_string())?;
+    let (source, path) = input.resolve()?;
 
     let registry = match path
         .and_then(Path::parent)
@@ -316,7 +352,7 @@ pub struct FormatOutcome {
 /// defaults. In `check_only` mode the formatted text is not returned — only
 /// whether the source is already formatted (`changed == false`).
 pub fn format(input: &Input, check_only: bool) -> Result<FormatOutcome, String> {
-    let (source, path) = input.resolve().map_err(|e| e.to_string())?;
+    let (source, path) = input.resolve()?;
 
     let opts = path.and_then(Path::parent).map(resolve_format_options);
     let result = match &opts {

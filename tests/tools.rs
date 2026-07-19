@@ -4,6 +4,7 @@
 
 use m1_mcp::analyze::{self, Input};
 use m1_mcp::doc::{self, DocKind};
+use m1_mcp::{limits, loader};
 
 // ---- doc reference --------------------------------------------------------
 
@@ -120,6 +121,95 @@ fn format_returns_text() {
     assert!(
         out.formatted.is_some(),
         "non-check mode returns formatted text"
+    );
+}
+
+// ---- per-request workload limits (issue #11) ------------------------------
+
+#[test]
+fn typecheck_rejects_oversized_inline_source() {
+    // One byte over the inline-source cap must be refused with a clear message
+    // naming the limit — not parsed.
+    let big = "A".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize + 1);
+    let err = analyze::typecheck(&Input::Inline(big), None)
+        .expect_err("oversize inline source must be rejected");
+    assert!(
+        err.contains("exceeds") && err.contains("per-request limit"),
+        "error should name the limit: {err}"
+    );
+}
+
+#[test]
+fn lint_rejects_oversized_file() {
+    // A file over the cap is rejected on its size (checked before reading),
+    // across every source-consuming tool (lint shares the same input path).
+    let dir = tempfile::tempdir().unwrap();
+    let scr = dir.path().join("big.m1scr");
+    std::fs::write(
+        &scr,
+        vec![b'A'; limits::MAX_REQUEST_SOURCE_BYTES as usize + 1],
+    )
+    .unwrap();
+    let err = analyze::lint(&Input::Path(scr)).expect_err("oversize file must be rejected");
+    assert!(
+        err.contains("exceeds") && err.contains("per-request limit"),
+        "error should name the limit: {err}"
+    );
+}
+
+#[test]
+fn source_at_the_limit_is_accepted() {
+    // The boundary is inclusive: source of exactly the cap is analysed, not
+    // rejected. (Newlines keep the parser cheap.)
+    let at = "\n".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize);
+    assert!(
+        analyze::lint(&Input::Inline(at)).is_ok(),
+        "source exactly at the limit must be accepted"
+    );
+}
+
+#[test]
+fn project_script_budget_rejects_huge_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("Project.m1prj");
+    std::fs::write(&proj, "<Project/>").unwrap();
+    for i in 0..(limits::MAX_PROJECT_SCRIPTS + 1) {
+        std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
+    }
+    let err = loader::check_project_script_budget(&proj)
+        .expect_err("a project over the script cap must be rejected");
+    assert!(
+        err.contains("exceeds") && err.contains("script"),
+        "error should name the script limit: {err}"
+    );
+}
+
+#[test]
+fn project_script_budget_allows_small_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("Project.m1prj");
+    std::fs::write(&proj, "<Project/>").unwrap();
+    for i in 0..3 {
+        std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
+    }
+    assert!(loader::check_project_script_budget(&proj).is_ok());
+}
+
+#[test]
+fn typecheck_rejects_over_budget_project_before_loading() {
+    // The budget guard fires before the project is loaded: the error is the
+    // script-limit message, not a project-parse failure on the dummy .m1prj.
+    let dir = tempfile::tempdir().unwrap();
+    let proj = dir.path().join("Project.m1prj");
+    std::fs::write(&proj, "<Project/>").unwrap();
+    for i in 0..(limits::MAX_PROJECT_SCRIPTS + 1) {
+        std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
+    }
+    let err = analyze::typecheck(&Input::Inline(GOOD.to_string()), Some(&proj))
+        .expect_err("over-budget project must be rejected");
+    assert!(
+        err.contains("exceeds") && err.contains("script"),
+        "error should name the script limit: {err}"
     );
 }
 
