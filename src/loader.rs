@@ -11,6 +11,31 @@ use std::path::Path;
 use m1_typecheck::parsed::{self, ParsedScript};
 use m1_typecheck::project::Project;
 
+use crate::limits;
+
+/// Bound the whole-project work a single request can trigger: error if the
+/// project rooted at `project_path` contains more than
+/// [`limits::MAX_PROJECT_SCRIPTS`] `.m1scr` files. Both project-wide operations
+/// (`m1_typecheck` given a `project`, and `m1_symbols`) call this first, so an
+/// over-limit project fails fast rather than walking and parsing an unbounded
+/// number of scripts on the single server task. The check is a directory walk
+/// only — no file contents are read — and runs before the project model is
+/// loaded.
+pub fn check_project_script_budget(project_path: &Path) -> Result<(), String> {
+    let Some(root) = project_path.parent() else {
+        return Ok(());
+    };
+    let count = m1_workspace::find_scripts(root).len();
+    if count > limits::MAX_PROJECT_SCRIPTS {
+        return Err(format!(
+            "project has {count} .m1scr files, which exceeds the {} script per-request limit; \
+             narrow the project or run the CLI directly",
+            limits::MAX_PROJECT_SCRIPTS,
+        ));
+    }
+    Ok(())
+}
+
 /// Load `project_path` (`Project.m1prj`) and layer in the discovered
 /// `parameters.m1cfg` (parameter types/units) and every `.m1dbc` under the
 /// project directory (CAN signal types/ranges). A malformed `.m1dbc` is skipped

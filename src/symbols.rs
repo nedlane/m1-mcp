@@ -69,6 +69,10 @@ pub fn list(
     filter: Option<&str>,
     limit: usize,
 ) -> Result<SymbolsOutcome, String> {
+    // Bound the whole-project work before loading anything (fail fast): refuse
+    // a project whose tree carries more than `MAX_PROJECT_SCRIPTS` scripts.
+    crate::loader::check_project_script_budget(project_path)?;
+
     // Load the project fully (parameters.m1cfg + .m1dbc), so parameter types/
     // units and CAN signals are populated rather than Unknown/absent.
     let project = crate::loader::load_project_full(project_path)?;
