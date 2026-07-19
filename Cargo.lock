@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "m1-mcp"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "m1-core",
