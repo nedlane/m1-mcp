@@ -99,6 +99,76 @@ fn typecheck_flags_a_syntax_error() {
 }
 
 #[test]
+fn typecheck_catches_cfg_typed_intrinsic_overload_mismatch() {
+    // EV-M1 regression: Calculate.Max has homogeneous Integer/Integer and
+    // Floating Point/Floating Point overloads. A u32 calibration parameter
+    // mixed with 1.0 must surface T065 through the MCP tool, not pass clean and
+    // wait for M1 Build Error 1302.
+    let dir = tempfile::tempdir().unwrap();
+    let project_dir = dir.path().join("UQR-EV").join("01.00");
+    let scripts_dir = project_dir.join("Scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    std::fs::write(
+        project_dir.join("Project.m1prj"),
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="EV" TargetHardware="ecu150">
+  <ComponentStream>
+   <List>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.CAN"/>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.CAN.DTI FSIC Rear"/>
+    <Component Classname="BuiltIn.Parameter" Name="Root.CAN.DTI FSIC Rear.Pole Pairs">
+     <Props Security="Calibration"/>
+    </Component>
+    <Component Classname="BuiltIn.FuncUser"
+      Filename="CAN.Inverters Transcieve 200hz.m1scr"
+      Name="Root.CAN.Inverters Transcieve 200hz"/>
+   </List>
+  </ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("parameters.m1cfg"),
+        r#"<?xml version="1.0"?>
+<Configuration>
+ <Group Name="">
+  <Parameter Name="CAN.DTI FSIC Rear.Pole Pairs">
+   <Cell Type="u32"><![CDATA[10]]></Cell>
+  </Parameter>
+ </Group>
+</Configuration>
+"#,
+    )
+    .unwrap();
+    let script = scripts_dir.join("CAN.Inverters Transcieve 200hz.m1scr");
+    std::fs::write(
+        &script,
+        "local fRearPolePairs = Calculate.Max(1.0, DTI FSIC Rear.Pole Pairs);\n",
+    )
+    .unwrap();
+
+    let out = analyze::typecheck(
+        &Input::Path(script),
+        Some(&project_dir.join("Project.m1prj")),
+    )
+    .expect("typecheck runs");
+    let hit = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "T065")
+        .expect("MCP must surface the intrinsic overload mismatch");
+    assert_eq!(hit.severity, "error");
+    assert!(
+        hit.message.contains("Floating Point, Unsigned Integer"),
+        "unexpected T065 message: {}",
+        hit.message
+    );
+}
+
+#[test]
 fn lint_returns_consistent_counts() {
     let out = analyze::lint(&Input::Inline(GOOD.to_string())).expect("lint runs");
     let warns = out
