@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::analyze::{self, Input};
-use crate::{doc, symbols};
+use crate::{can, doc, symbols};
 
 /// Guidance surfaced to the agent on connect.
 const INSTRUCTIONS: &str = "\
@@ -21,7 +21,13 @@ confirm builtin function signatures, enum spellings, and which functions are \
 calibration-only BEFORE writing M1 script — do not guess. After editing a `.m1scr`, \
 run `m1_typecheck`, `m1_lint`, and `m1_format` (check_only) on it. Pass either inline \
 `source` or a file `path`; give `project` (a Project.m1prj) to enable cross-script and \
-reference-keyword checks. `m1_symbols` lists a project's channels/parameters/functions.";
+reference-keyword checks. `m1_symbols` lists a project's channels/parameters/functions.
+CAN: never judge CAN traffic from the `.m1dbc` files alone — a DBC carries no bus until a script \
+binds it with `DBC.<Name>.Init(<bus>)` (M1 Build Error 1375 if none does), and CAN identifiers are \
+per bus. Call `m1_can` for any CAN question: it reports each DBC module's bus binding (with the \
+`Init` call site) and classifies every repeated CAN id as `same-bus` (a real clash), \
+`different-bus` (proven safe) or `unknown`. Two messages sharing an id on different buses are NOT \
+a conflict.";
 
 /// Turn the shared `source` / `path` params into an analysis input, requiring
 /// exactly one of them.
@@ -102,6 +108,21 @@ pub struct SymbolsParams {
     pub filter: Option<String>,
     /// Cap the number of symbols returned (default 200; the `total` field always
     /// reports the full count).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CanParams {
+    /// Path to a `Project.m1prj`.
+    pub project: String,
+    /// Only return messages whose path contains this substring
+    /// (case-insensitive). Bus bindings and id verdicts are always computed over
+    /// every message, filtered or not.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Cap the number of messages returned (default 200; `total_messages`
+    /// always reports the full count).
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -194,6 +215,24 @@ impl M1Server {
         Parameters(p): Parameters<SymbolsParams>,
     ) -> Result<Json<symbols::SymbolsOutcome>, ErrorData> {
         symbols::list(
+            &PathBuf::from(&p.project),
+            p.filter.as_deref(),
+            p.limit.unwrap_or(200),
+        )
+        .map(Json)
+        .map_err(|e| ErrorData::invalid_params(e, None))
+    }
+
+    /// Report the project's CAN model: DBC modules, the bus each is `Init`-ed
+    /// on, and whether repeated CAN ids actually clash.
+    #[tool(
+        description = "Inspect a project's CAN setup. Returns every `.m1dbc` module with the CAN bus a script binds it to (`DBC.<Name>.Init(<bus>)` — a DBC has NO bus until then, M1 Build Error 1375), every message with its CAN id and bus, and each repeated CAN id judged `same-bus` (a real clash), `different-bus` (proven safe — same id on separate buses is not a conflict) or `unknown` (bus is a parameter/expression, so nothing is proven). Use this for any CAN id / bus question instead of reading the .m1dbc files."
+    )]
+    async fn m1_can(
+        &self,
+        Parameters(p): Parameters<CanParams>,
+    ) -> Result<Json<can::CanOutcome>, ErrorData> {
+        can::inspect(
             &PathBuf::from(&p.project),
             p.filter.as_deref(),
             p.limit.unwrap_or(200),

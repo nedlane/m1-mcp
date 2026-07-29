@@ -23,6 +23,9 @@ PATH dependency on installed CLIs.
 - `analyze` — runs the analysers over agent-supplied source (`m1_typecheck`,
   `m1_lint`, `m1_format`).
 - `symbols` — lists a project's workspace symbols (`m1_symbols`).
+- `can` — reconstructs the project's CAN picture (`m1_can`): which `.m1dbc`
+  module a script binds to which bus via `DBC.<Name>.Init(<bus>)`, and whether a
+  repeated CAN id is a real clash.
 - `server` — the `rmcp` tool router wiring the above; each tool returns
   structured JSON.
 
@@ -38,6 +41,12 @@ PATH dependency on installed CLIs.
   results in a struct, never return a bare array.
 - Bad input is a structured tool error, never a panic; syntax errors in M1
   source are reported as diagnostics, not failures.
+- **CAN answers are per bus, and never guessed.** A `.m1dbc` has no bus until a
+  script calls `DBC.<Name>.Init(<bus>)`, so `m1_can` only calls a repeated CAN id
+  a clash when both modules are provably on the same bus, only calls it safe when
+  both buses are distinct literals, and otherwise says `unknown`. Keep that
+  three-way honesty — an agent acting on a false "conflict" edits working
+  vehicle code.
 - No MSRV gate: this is a leaf binary (nothing pins it) with a large async dep
   whose transitive MSRV floats.
 
