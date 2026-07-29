@@ -44,9 +44,13 @@ PATH dependency on installed CLIs.
 - **CAN answers are per bus, and never guessed.** A `.m1dbc` has no bus until a
   script calls `DBC.<Name>.Init(<bus>)`, so `m1_can` only calls a repeated CAN id
   a clash when both modules are provably on the same bus, only calls it safe when
-  both buses are distinct literals, and otherwise says `unknown`. Keep that
-  three-way honesty — an agent acting on a false "conflict" edits working
-  vehicle code.
+  their buses provably differ, and otherwise says `unknown`. Keep that three-way
+  honesty — an agent acting on a false "conflict" edits working vehicle code.
+- **A calibration value is not a constant.** A bus resolved from
+  `parameters.m1cfg` is the current calibration; one from a `.m1prj` constant is
+  fixed. `m1_can` keeps them apart (`depends_on_calibration`) instead of
+  flattening both into "the bus number" — a retune must not silently invalidate
+  an answer an agent was given as proof.
 - No MSRV gate: this is a leaf binary (nothing pins it) with a large async dep
   whose transitive MSRV floats.
 

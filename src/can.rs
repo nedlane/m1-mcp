@@ -28,19 +28,22 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Guidance returned with every response, so the rule travels with the data.
-const GUIDANCE: [&str; 4] = [
+const GUIDANCE: [&str; 5] = [
     "A `.m1dbc` has no CAN bus of its own: a script must bind it with `DBC.<Name>.Init(<bus>)` \
      (conventionally one `CAN Init` script). A DBC that is used but never initialised is M1 Build \
      Error 1375 (m1-typecheck T107).",
     "CAN identifiers are per bus. Two messages sharing an id do NOT conflict when their modules \
-     were initialised on different buses — check `bus` before ever reporting a clash.",
-    "`verdict: \"different-bus\"` means proven safe (both buses are literals, and they differ). \
-     `\"same-bus\"` means a real clash. `\"unknown\"` means the bus argument is not a static value \
-     (usually a calibratable Parameter or channel) — say so, do not guess either way.",
-    "Two different bus expressions are only *unknown*, not different: distinct constants/parameters \
-     may still hold the same bus number at run time.",
+     were initialised on different buses — check `bus`/`bus_value` before ever reporting a clash.",
+    "A bus argument that names a symbol is resolved to a number where the project knows one: a \
+     constant's `.m1prj` `Value`, or a parameter's cell in `parameters.m1cfg`. That number is in \
+     `bus_value`.",
+    "`verdict: \"different-bus\"` means proven safe, `\"same-bus\"` a real clash, and \
+     `\"unknown\"` that at least one bus has no known value (uninitialised, or a symbol the \
+     project carries no value for) — say so, do not guess.",
+    "`depends_on_calibration: true` means the verdict rests on a parameter's value in \
+     `parameters.m1cfg`: it holds for this calibration, and a retune can change it. Verdicts from \
+     literals and constants alone are retune-proof.",
 ];
-
 /// How a module's bus argument was classified.
 fn bus_kind_str(k: SymbolKind) -> &'static str {
     match k {
@@ -62,10 +65,17 @@ pub struct CanInitDto {
     pub call: String,
     /// The bus argument verbatim (`1`, `Active Bus`, …).
     pub bus: String,
-    /// `literal` (a bus number the model can compare), `constant`, `parameter`,
-    /// `channel`, `symbol`, or `expression` — anything but `literal` means the
-    /// bus is not statically known here.
+    /// What the argument is: `literal`, `constant`, `parameter`, `channel`,
+    /// `symbol` or `expression`.
     pub bus_kind: String,
+    /// The bus number the argument resolves to: the literal itself, a constant's
+    /// `.m1prj` value, or a parameter's `parameters.m1cfg` cell. `None` when the
+    /// project carries no value for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus_value: Option<i64>,
+    /// True when `bus_value` came from the current calibration (a parameter
+    /// cell) rather than a literal or a project constant — a retune moves it.
+    pub bus_calibrated: bool,
 }
 
 /// A DBC module (one `.m1dbc`) and the bus it was initialised on.
@@ -88,6 +98,11 @@ pub struct CanModuleDto {
     /// Classification of `bus` (`literal`, `parameter`, …); `none` when
     /// uninitialised, `conflicting-init` when the `Init` calls disagree.
     pub bus_kind: String,
+    /// The bus number `bus` resolves to — see [`CanInitDto::bus_value`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus_value: Option<i64>,
+    /// True when `bus_value` is a calibration value that a retune moves.
+    pub bus_calibrated: bool,
     /// Every `Init` call site found for this module.
     pub init_calls: Vec<CanInitDto>,
 }
@@ -115,6 +130,11 @@ pub struct CanMessageDto {
     pub bus: Option<String>,
     /// Classification of `bus` — see [`CanModuleDto::bus_kind`].
     pub bus_kind: String,
+    /// The bus number `bus` resolves to — see [`CanInitDto::bus_value`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus_value: Option<i64>,
+    /// True when `bus_value` is a calibration value that a retune moves.
+    pub bus_calibrated: bool,
 }
 
 /// One member of a repeated-id group.
@@ -126,6 +146,9 @@ pub struct CanOverlapMemberDto {
     pub bus: Option<String>,
     pub bus_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bus_value: Option<i64>,
+    pub bus_calibrated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
 }
 
@@ -135,13 +158,17 @@ pub struct CanOverlapMemberDto {
 pub struct CanIdOverlapDto {
     pub can_id: u32,
     pub can_id_hex: String,
-    /// `same-bus` (a real clash), `different-bus` (proven safe — the buses are
-    /// distinct literals), or `unknown` (at least one bus is not a static
-    /// value, so nothing is proven).
+    /// `same-bus` (a real clash), `different-bus` (proven safe — the buses
+    /// resolve to different numbers), or `unknown` (at least one bus has no
+    /// known value, so nothing is proven).
     pub verdict: String,
     /// The shared bus, when the verdict is `same-bus`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bus: Option<String>,
+    /// True when the verdict rests on a **calibration** value from
+    /// `parameters.m1cfg` rather than on literals and project constants alone —
+    /// i.e. it holds for the loaded calibration, and a retune can change it.
+    pub depends_on_calibration: bool,
     /// Why the verdict came out this way, in one sentence.
     pub note: String,
     pub messages: Vec<CanOverlapMemberDto>,
@@ -164,24 +191,52 @@ pub struct CanOutcome {
     pub guidance: Vec<String>,
 }
 
-/// A bus argument, in the only two forms that can be compared.
+/// A bus argument reduced to something comparable.
 #[derive(Debug, Clone, PartialEq)]
 enum Bus {
-    /// A literal bus number — comparable with certainty.
-    Literal(i64),
-    /// A symbol or expression, kept verbatim (normalised whitespace).
+    /// A known bus number: written literally, or resolved from the symbol the
+    /// argument names — a constant's `.m1prj` value, or a parameter's cell in
+    /// `parameters.m1cfg`. `calibrated` marks the latter: the number is the
+    /// project's *current calibration*, and a retune moves it.
+    Number { value: i64, calibrated: bool },
+    /// A symbol (or expression) whose value is not known, kept verbatim.
     Symbolic(String),
 }
 
+/// The outcome of comparing two buses: whether they are the same, and whether
+/// that answer leaned on a calibratable value.
+struct BusVerdict {
+    same: bool,
+    calibrated: bool,
+}
+
 impl Bus {
-    /// `Some(true)`/`Some(false)` when the two buses are provably the same or
-    /// provably different; `None` when it cannot be decided. Two *different*
-    /// symbolic spellings are undecidable — distinct constants or parameters may
-    /// still carry the same bus number at run time.
-    fn same_as(&self, other: &Bus) -> Option<bool> {
+    /// `Some(...)` when the two buses are provably the same or provably
+    /// different; `None` when it cannot be decided.
+    ///
+    /// Two *different* symbolic spellings stay undecidable — distinct symbols
+    /// with no known value may still carry the same bus number at run time. The
+    /// same symbol on both sides is decided without any calibration caveat: even
+    /// if it is a calibratable parameter, both modules move with it together.
+    fn same_as(&self, other: &Bus) -> Option<BusVerdict> {
         match (self, other) {
-            (Bus::Literal(a), Bus::Literal(b)) => Some(a == b),
-            (Bus::Symbolic(a), Bus::Symbolic(b)) if a == b => Some(true),
+            (
+                Bus::Number {
+                    value: a,
+                    calibrated: ca,
+                },
+                Bus::Number {
+                    value: b,
+                    calibrated: cb,
+                },
+            ) => Some(BusVerdict {
+                same: a == b,
+                calibrated: *ca || *cb,
+            }),
+            (Bus::Symbolic(a), Bus::Symbolic(b)) if a == b => Some(BusVerdict {
+                same: true,
+                calibrated: false,
+            }),
             _ => None,
         }
     }
@@ -205,7 +260,7 @@ fn collect_init_calls(
     n: Node,
     dbc_paths: &[String],
     script: &str,
-    resolve_bus: &dyn Fn(&str) -> String,
+    resolve_bus: &dyn Fn(&str) -> BusArg,
     out: &mut Vec<(String, CanInitDto)>,
 ) {
     if n.kind() == Kind::CallExpression
@@ -225,14 +280,17 @@ fn collect_init_calls(
                 .and_then(|args| args.named_children().into_iter().next())
                 .map(|a| normalise(a.text()))
                 .unwrap_or_default();
+            let arg = resolve_bus(&bus);
             out.push((
                 leaf(obj).to_string(),
                 CanInitDto {
                     script: script.to_string(),
                     line: n.range().start.line + 1,
                     call: normalise(n.text()),
-                    bus_kind: resolve_bus(&bus).to_string(),
                     bus,
+                    bus_kind: arg.kind,
+                    bus_value: arg.value,
+                    bus_calibrated: arg.calibrated,
                 },
             ));
         }
@@ -242,40 +300,89 @@ fn collect_init_calls(
     }
 }
 
-/// Classify a bus argument: a literal number, else the kind of the symbol it
-/// names (constant / parameter / channel), else a plain expression.
-fn classify_bus(arg: &str, project: &Project) -> String {
-    if arg.is_empty() {
-        return "expression".to_string();
+/// A bus argument, classified and (where possible) resolved to a number.
+#[derive(Debug, Clone, Default)]
+struct BusArg {
+    /// `literal`, `constant`, `parameter`, `channel`, `symbol` or `expression`.
+    kind: String,
+    /// The bus number, when it is knowable: written literally, or carried by the
+    /// symbol the argument names.
+    value: Option<i64>,
+    /// True when `value` came from a calibratable symbol rather than a literal
+    /// or a project constant.
+    calibrated: bool,
+}
+
+/// Read a `.m1prj`/`.m1cfg` value as a bus number. Cells are exported in the
+/// declared cell type, so an `f32` bus lands as `2.00000000000000000e+00`;
+/// accept it only when it is exactly integral.
+fn bus_number(text: &str) -> Option<i64> {
+    if let Ok(n) = text.parse::<i64>() {
+        return Some(n);
     }
-    if arg.parse::<i64>().is_ok() {
-        return "literal".to_string();
+    let f = text.parse::<f64>().ok()?;
+    (f.fract() == 0.0 && f.abs() < i64::MAX as f64).then_some(f as i64)
+}
+
+/// Classify a bus argument: a literal number, else the symbol it names — whose
+/// kind and statically-known value (a constant's `.m1prj` `Value`, a parameter's
+/// `parameters.m1cfg` cell) both come from the loaded project model.
+fn classify_bus(arg: &str, project: &Project) -> BusArg {
+    if arg.is_empty() {
+        return BusArg {
+            kind: "expression".to_string(),
+            ..BusArg::default()
+        };
+    }
+    if let Ok(value) = arg.parse::<i64>() {
+        return BusArg {
+            kind: "literal".to_string(),
+            value: Some(value),
+            calibrated: false,
+        };
     }
     // A script writes the bus symbol by its tail (`Active Bus`), while the
     // project stores the full path (`Root.CAN.Active Bus`); match either.
     let suffix = format!(".{arg}");
     let mut kinds: BTreeSet<&'static str> = BTreeSet::new();
+    let mut values: BTreeSet<i64> = BTreeSet::new();
+    let mut is_constant = true;
     for s in project.symbols().iter() {
         if s.path == arg || s.path.ends_with(&suffix) {
             kinds.insert(bus_kind_str(s.kind));
+            if let Some(v) = s.static_value.as_deref().and_then(bus_number) {
+                values.insert(v);
+                is_constant &= s.kind == SymbolKind::Constant;
+            }
         }
     }
-    match kinds.len() {
+    // More than one symbol answers to this name, or they disagree on a value:
+    // resolve nothing rather than pick one.
+    let kind = match kinds.len() {
         1 => kinds.into_iter().next().unwrap().to_string(),
         _ => "expression".to_string(),
+    };
+    let value = (values.len() == 1).then(|| *values.iter().next().unwrap());
+    BusArg {
+        kind,
+        value,
+        // A constant is fixed by the project; anything else with a value got it
+        // from the current calibration.
+        calibrated: value.is_some() && !is_constant,
     }
 }
 
-/// Parse a classified bus argument into a comparable [`Bus`].
-fn bus_value(bus: &str, kind: &str) -> Option<Bus> {
+/// Turn a recorded bus argument back into a comparable [`Bus`].
+fn bus_of(bus: &str, kind: &str, value: Option<i64>, calibrated: bool) -> Option<Bus> {
     if bus.is_empty() {
         return None;
     }
-    match kind {
-        "literal" => bus.parse::<i64>().ok().map(Bus::Literal),
-        // Not a static value here, but still identity-comparable: the same
-        // symbol is necessarily the same bus.
-        _ => Some(Bus::Symbolic(bus.to_string())),
+    match value {
+        Some(value) => Some(Bus::Number { value, calibrated }),
+        // No value, but still identity-comparable: the same symbol is
+        // necessarily the same bus. An `expression` is not even that.
+        None if kind != "expression" => Some(Bus::Symbolic(bus.to_string())),
+        None => None,
     }
 }
 
@@ -327,20 +434,28 @@ pub fn inspect(
 
     // Resolve each module's bus: one agreed argument, or none.
     let mut modules: Vec<CanModuleDto> = Vec::new();
-    let mut bus_of: BTreeMap<String, (Option<String>, String)> = BTreeMap::new();
+    // module leaf -> (bus argument, kind, resolved number, calibration-sourced)
+    type BusBinding = (Option<String>, String, Option<i64>, bool);
+    let mut bus_of: BTreeMap<String, BusBinding> = BTreeMap::new();
     for name in &leaves {
         let calls = init_by_module.get(name).cloned().unwrap_or_default();
         let distinct: BTreeSet<&str> = calls.iter().map(|c| c.bus.as_str()).collect();
-        let (bus, bus_kind) = match distinct.len() {
-            0 => (None, "none".to_string()),
+        let binding: BusBinding = match distinct.len() {
+            0 => (None, "none".to_string(), None, false),
             1 => {
                 let call = &calls[0];
-                (Some(call.bus.clone()), call.bus_kind.clone())
+                (
+                    Some(call.bus.clone()),
+                    call.bus_kind.clone(),
+                    call.bus_value,
+                    call.bus_calibrated,
+                )
             }
             // Disagreeing `Init` calls: no single bus can be assumed.
-            _ => (None, "conflicting-init".to_string()),
+            _ => (None, "conflicting-init".to_string(), None, false),
         };
-        bus_of.insert(name.clone(), (bus.clone(), bus_kind.clone()));
+        bus_of.insert(name.clone(), binding.clone());
+        let (bus, bus_kind, bus_value, bus_calibrated) = binding;
         modules.push(CanModuleDto {
             name: name.clone(),
             file: files.get(name).cloned(),
@@ -348,6 +463,8 @@ pub fn inspect(
             initialised: !calls.is_empty(),
             bus,
             bus_kind,
+            bus_value,
+            bus_calibrated,
             init_calls: calls,
         });
     }
@@ -365,10 +482,11 @@ pub fn inspect(
             .max_by_key(|l| l.len())
             .cloned()
             .unwrap_or_else(|| leaf(&s.path).to_string());
-        let (bus, bus_kind) = bus_of
-            .get(&module)
-            .cloned()
-            .unwrap_or((None, "none".to_string()));
+        let (bus, bus_kind, bus_value, bus_calibrated) =
+            bus_of
+                .get(&module)
+                .cloned()
+                .unwrap_or((None, "none".to_string(), None, false));
         let can = s.can.as_ref();
         messages.push(CanMessageDto {
             path: s.path.clone(),
@@ -385,6 +503,8 @@ pub fn inspect(
             }),
             bus,
             bus_kind,
+            bus_value,
+            bus_calibrated,
         });
     }
     messages.sort_by(|a, b| a.path.cmp(&b.path));
@@ -431,21 +551,30 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
             continue;
         }
         // Pairwise: any provably-shared bus is a clash; otherwise any
-        // undecidable pair keeps the whole group unknown.
+        // undecidable pair keeps the whole group unknown. Track whether the
+        // deciding comparisons leaned on a calibration value, so a verdict that
+        // a retune could invalidate says so.
         let mut shared_bus: Option<String> = None;
         let mut undecidable = false;
+        let mut calibrated = false;
         for (i, a) in group.iter().enumerate() {
             for b in &group[i + 1..] {
                 let (av, bv) = (
-                    a.bus.as_deref().and_then(|s| bus_value(s, &a.bus_kind)),
-                    b.bus.as_deref().and_then(|s| bus_value(s, &b.bus_kind)),
+                    a.bus
+                        .as_deref()
+                        .and_then(|s| bus_of(s, &a.bus_kind, a.bus_value, a.bus_calibrated)),
+                    b.bus
+                        .as_deref()
+                        .and_then(|s| bus_of(s, &b.bus_kind, b.bus_value, b.bus_calibrated)),
                 );
                 match (av, bv) {
                     (Some(x), Some(y)) => match x.same_as(&y) {
-                        Some(true) => {
-                            shared_bus.get_or_insert_with(|| a.bus.clone().unwrap_or_default());
+                        Some(v) => {
+                            calibrated |= v.calibrated;
+                            if v.same {
+                                shared_bus.get_or_insert_with(|| a.bus.clone().unwrap_or_default());
+                            }
                         }
-                        Some(false) => {}
                         None => undecidable = true,
                     },
                     // An uninitialised module has no bus at all.
@@ -453,24 +582,35 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
                 }
             }
         }
+        // A caveat only matters for a verdict that was actually decided.
+        let calibrated = calibrated && !(undecidable && shared_bus.is_none());
+        let caveat = if calibrated {
+            " — but only for the calibration in parameters.m1cfg: the bus comes from a parameter, \
+             so a retune can change this"
+        } else {
+            ""
+        };
         let (verdict, note) = if shared_bus.is_some() {
             (
                 "same-bus",
-                "two or more messages with this id are on the same bus — a real CAN id clash"
-                    .to_string(),
+                format!(
+                    "two or more messages with this id are on the same bus — a real CAN id clash{caveat}"
+                ),
             )
         } else if undecidable {
             (
                 "unknown",
-                "at least one module's bus is not a static value (uninitialised, or Init'd with a \
-                 constant/parameter/expression), so this id cannot be proven safe or clashing — \
-                 check the bus binding before reporting it"
+                "at least one module's bus has no known value (uninitialised, or Init'd with a \
+                 symbol the project carries no value for), so this id cannot be proven safe or \
+                 clashing — check the bus binding before reporting it"
                     .to_string(),
             )
         } else {
             (
                 "different-bus",
-                "every message with this id is on a different CAN bus — not a clash".to_string(),
+                format!(
+                    "every message with this id is on a different CAN bus — not a clash{caveat}"
+                ),
             )
         };
         out.push(CanIdOverlapDto {
@@ -478,6 +618,7 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
             can_id_hex: format!("0x{id:X}"),
             verdict: verdict.to_string(),
             bus: shared_bus,
+            depends_on_calibration: calibrated,
             note,
             messages: group
                 .iter()
@@ -486,6 +627,8 @@ fn overlaps(messages: &[CanMessageDto]) -> Vec<CanIdOverlapDto> {
                     module: m.module.clone(),
                     bus: m.bus.clone(),
                     bus_kind: m.bus_kind.clone(),
+                    bus_value: m.bus_value,
+                    bus_calibrated: m.bus_calibrated,
                     direction: m.direction.clone(),
                 })
                 .collect(),

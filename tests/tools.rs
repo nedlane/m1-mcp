@@ -343,13 +343,18 @@ fn m1dbc(module: &str, messages: &[(&str, u32)]) -> String {
 }
 
 /// A project mirroring the real corpora's CAN layout: several `.m1dbc` modules
-/// bound to buses by one `CAN Init` script.
+/// bound to buses by one `CAN Init` script, with the bus symbols valued the way
+/// the real projects value them (a `.m1prj` constant, a `parameters.m1cfg` cell).
 ///
 /// - `Alpha` (bus 1) and `Beta` (bus 2) both declare id 133 — different buses,
 ///   not a clash (this is exactly what EV-M1 does with `SBG DBC`/`DTI FSIC RL`).
 /// - `Alpha` and `Epsilon` are both on bus 1 and both declare id 155 — a real clash.
-/// - `Gamma` is bound to a calibratable Parameter and `Delta` is never
+/// - `Gamma` is bound to the parameter `Spare Bus` (cfg: 2) and `Delta` is never
 ///   initialised; they share id 144, which can be neither proven nor dismissed.
+/// - `Zeta` is bound to the constant `Active Bus` (`.m1prj`: 0) and `Eta` to a
+///   literal 0; they share id 177 — a clash, and a retune cannot undo it.
+/// - `Theta` (`Spare Bus`, cfg: 2) and `Iota` (literal 1) share id 188 — safe,
+///   but only for this calibration.
 fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let project_dir = dir.path().join("UQR-X").join("01.00");
@@ -369,6 +374,9 @@ fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     <Component Classname="BuiltIn.Parameter" Name="Root.CAN.Spare Bus">
      <Props Type="s32" Security="Calibration"/>
     </Component>
+    <Component Classname="BuiltIn.Constant" Name="Root.CAN.Active Bus">
+     <Props Type="s32" Value="0"/>
+    </Component>
     <Component Classname="BuiltIn.FuncUser" Filename="CAN.CAN Init.m1scr" Name="Root.CAN.CAN Init"/>
     <Component Classname="BuiltIn.CAN.DBCRoot" Name="DBC"/>
     <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Alpha"/>
@@ -376,6 +384,10 @@ fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Gamma"/>
     <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Delta"/>
     <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Epsilon"/>
+    <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Zeta"/>
+    <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Eta"/>
+    <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Theta"/>
+    <Component Classname="BuiltIn.CAN.DBC" Name="DBC.Iota"/>
    </List>
   </ComponentStream>
  </Project>
@@ -390,6 +402,10 @@ fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         ("Gamma", &[("Status", 144)][..]),
         ("Delta", &[("Status", 144)][..]),
         ("Epsilon", &[("Status", 155)][..]),
+        ("Zeta", &[("Status", 177)][..]),
+        ("Eta", &[("Status", 177)][..]),
+        ("Theta", &[("Status", 188)][..]),
+        ("Iota", &[("Status", 188)][..]),
     ] {
         std::fs::write(
             dbc_dir.join(format!("{module}.m1dbc")),
@@ -400,7 +416,24 @@ fn can_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
 
     std::fs::write(
         scripts_dir.join("CAN.CAN Init.m1scr"),
-        "DBC.Alpha.Init(1);\nDBC.Beta.Init(2);\nDBC.Gamma.Init(Spare Bus);\nDBC.Epsilon.Init(1);\n",
+        "DBC.Alpha.Init(1);\nDBC.Beta.Init(2);\nDBC.Gamma.Init(Spare Bus);\nDBC.Epsilon.Init(1);\n\
+         DBC.Zeta.Init(Active Bus);\nDBC.Eta.Init(0);\nDBC.Theta.Init(Spare Bus);\nDBC.Iota.Init(1);\n",
+    )
+    .unwrap();
+
+    // The calibration: a parameter's value lives only here (real exports drop
+    // the implicit `Root.` prefix, as this one does).
+    std::fs::write(
+        dir.path().join("parameters.m1cfg"),
+        r#"<?xml version="1.0"?>
+<Configuration>
+ <Group Name="">
+  <Parameter Name="CAN.Spare Bus">
+   <Cell Type="s32"><![CDATA[2]]></Cell>
+  </Parameter>
+ </Group>
+</Configuration>
+"#,
     )
     .unwrap();
 
@@ -423,10 +456,68 @@ fn can_binds_each_dbc_module_to_the_bus_its_init_call_names() {
     assert_eq!(init.line, 1, "1-based line of the Init call");
     assert!(init.call.starts_with("DBC.Alpha.Init"), "{}", init.call);
 
-    // A bus that is a calibratable parameter is reported as such — not a number.
+    assert_eq!(alpha.bus_value, Some(1), "a literal resolves to itself");
+    assert!(!alpha.bus_calibrated);
+
+    // A parameter bus resolves through parameters.m1cfg — the only place a
+    // parameter's value exists — and is marked as calibration-sourced.
     let gamma = out.modules.iter().find(|m| m.name == "Gamma").unwrap();
     assert_eq!(gamma.bus.as_deref(), Some("Spare Bus"));
     assert_eq!(gamma.bus_kind, "parameter");
+    assert_eq!(gamma.bus_value, Some(2), "from the .m1cfg cell");
+    assert!(gamma.bus_calibrated, "a retune can move it");
+
+    // A constant bus resolves from the .m1prj and is NOT calibration-dependent.
+    let zeta = out.modules.iter().find(|m| m.name == "Zeta").unwrap();
+    assert_eq!(zeta.bus.as_deref(), Some("Active Bus"));
+    assert_eq!(zeta.bus_kind, "constant");
+    assert_eq!(zeta.bus_value, Some(0), "from the .m1prj Props Value");
+    assert!(!zeta.bus_calibrated);
+}
+
+#[test]
+fn can_matches_a_constant_bus_against_a_literal_one() {
+    let (_dir, project) = can_fixture();
+    let out = can::inspect(&project, None, 200).expect("can inspect runs");
+
+    // `Active Bus` is a constant with value 0, so `Init(Active Bus)` and
+    // `Init(0)` are the same bus — provable without any calibration.
+    let o = out
+        .id_overlaps
+        .iter()
+        .find(|o| o.can_id == 177)
+        .expect("id 177 is declared twice");
+    assert_eq!(o.verdict, "same-bus", "{}", o.note);
+    assert!(
+        !o.depends_on_calibration,
+        "a constant is fixed by the project, so no retune caveat: {}",
+        o.note
+    );
+}
+
+#[test]
+fn can_flags_a_verdict_that_rests_on_calibration() {
+    let (_dir, project) = can_fixture();
+    let out = can::inspect(&project, None, 200).expect("can inspect runs");
+
+    // `Spare Bus` (cfg: 2) vs literal 1 — different buses today, but retuning
+    // the parameter to 1 would make it a clash. The verdict says so.
+    let o = out
+        .id_overlaps
+        .iter()
+        .find(|o| o.can_id == 188)
+        .expect("id 188 is declared twice");
+    assert_eq!(o.verdict, "different-bus", "{}", o.note);
+    assert!(
+        o.depends_on_calibration,
+        "the bus came from parameters.m1cfg: {}",
+        o.note
+    );
+    assert!(
+        o.note.contains("retune"),
+        "the note must spell the caveat out: {}",
+        o.note
+    );
 }
 
 #[test]
@@ -490,10 +581,14 @@ fn can_leaves_a_non_static_bus_undecided() {
         .expect("id 144 is declared twice");
     assert_eq!(
         o.verdict, "unknown",
-        "a parameter bus and an uninitialised module prove nothing: {}",
+        "an uninitialised module has no bus at all, so nothing is proven: {}",
         o.note
     );
     assert!(o.bus.is_none());
+    assert!(
+        !o.depends_on_calibration,
+        "an undecided verdict rests on nothing, calibration included"
+    );
 }
 
 #[test]
@@ -501,7 +596,7 @@ fn can_lists_messages_with_id_direction_and_bus() {
     let (_dir, project) = can_fixture();
     let out = can::inspect(&project, None, 200).expect("can inspect runs");
 
-    assert_eq!(out.total_messages, 6);
+    assert_eq!(out.total_messages, 10);
     let m = out
         .messages
         .iter()
@@ -529,7 +624,7 @@ fn can_filter_and_limit_narrow_messages_but_not_the_verdicts() {
 
     assert_eq!(out.messages.len(), 1, "limit caps the returned list");
     assert!(out.messages[0].path.starts_with("Alpha."));
-    assert_eq!(out.total_messages, 6, "total is the unfiltered count");
+    assert_eq!(out.total_messages, 10, "total is the unfiltered count");
     assert!(
         out.id_overlaps.iter().any(|o| o.can_id == 144),
         "overlaps are computed over every message, not the filtered subset"

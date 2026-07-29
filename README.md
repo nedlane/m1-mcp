@@ -37,14 +37,21 @@ site) and classifies every repeated CAN id:
 - **`same-bus`** — a real clash: two messages with that id on one bus.
 - **`different-bus`** — proven safe. The real EV corpus relies on this:
   `SBG DBC.Init(2)` and `DTI FSIC RL.Init(1)` both declare ids 133/173.
-- **`unknown`** — at least one module is uninitialised or was bound with a
-  calibratable parameter/expression rather than a literal bus number, so nothing
-  is proven either way. Report it as unknown; do not guess.
+- **`unknown`** — at least one module is uninitialised, or its bus is a symbol
+  the project carries no value for, so nothing is proven either way. Report it
+  as unknown; do not guess.
 
-Bus arguments are compared by identity: two modules initialised with the *same*
-symbol are on the same bus, but two *different* symbols (or a symbol against a
-literal) stay `unknown`, since a constant's value is not carried in the project
-model.
+A bus argument that names a symbol is **resolved to a number** where the project
+knows one — a constant's `.m1prj` `Value`, or a parameter's cell in
+`parameters.m1cfg` — and that number is reported as `bus_value`. So AV-M1's
+`DBC.Dash.Init(Active Bus)` reads as bus 0 and `DBC.Datalogger.Init(Datalogger
+Bus)` as bus 2, rather than two opaque names.
+
+A value that came from the `.m1cfg` is the project's **current calibration**, so
+a verdict resting on one is marked `depends_on_calibration: true`: it holds for
+the loaded calibration and a retune can change it. Verdicts from literals and
+project constants alone are retune-proof. Two modules bound to the *same* symbol
+are the same bus either way.
 
 The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary
