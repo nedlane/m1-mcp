@@ -1,6 +1,6 @@
 [package]
 name = "m1-mcp"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Model Context Protocol server exposing the MoTeC M1 toolchain to AI agents"
 license = "GPL-3.0-or-later"
@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the stack — never path deps). These are called in-process; there is no PATH
 # dependency on installed CLIs.
 m1-core = { git = "https://github.com/C-Nucifora/m1-core.git", tag = "v0.15.0" }
-m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.48.0" }
+m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "v0.49.0" }
 m1-lint = { git = "https://github.com/C-Nucifora/m1-lint.git", tag = "v0.24.0" }
 m1-fmt = { git = "https://github.com/C-Nucifora/m1-fmt.git", tag = "v0.17.0" }
 m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
