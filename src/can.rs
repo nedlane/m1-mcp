@@ -28,7 +28,11 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Guidance returned with every response, so the rule travels with the data.
-const GUIDANCE: [&str; 5] = [
+const GUIDANCE: [&str; 6] = [
+    "`.m1dbc` files store `CANId` (and the other integer attributes) in HEXADECIMAL without a \
+     prefix — `CANId=\"133\"` is 0x133 = 307, not decimal 133. `can_id` here is the correctly \
+     parsed number and `can_id_hex` matches the file's own spelling; never re-read the raw XML \
+     as decimal.",
     "A `.m1dbc` has no CAN bus of its own: a script must bind it with `DBC.<Name>.Init(<bus>)` \
      (conventionally one `CAN Init` script). A DBC that is used but never initialised is M1 Build \
      Error 1375 (m1-typecheck T107).",
@@ -114,11 +118,17 @@ pub struct CanMessageDto {
     pub path: String,
     /// Owning DBC module.
     pub module: String,
+    /// The parsed CAN identifier. The `.m1dbc` stores `CANId` in hexadecimal
+    /// without a prefix (`CANId="4B3"` is 0x4B3) — this is the resulting number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_id: Option<u32>,
-    /// `can_id` in hex, the form DBC/CAN tooling usually prints.
+    /// `can_id` in hex, the form DBC/CAN tooling usually prints (and the form
+    /// the `.m1dbc` itself uses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub can_id_hex: Option<String>,
+    /// True when the message declares `IdType="Extended"` — a 29-bit id rather
+    /// than a standard 11-bit one.
+    pub extended: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dlc: Option<u32>,
     /// `RX` (the M1 receives) or `TX` (the M1 transmits); absent when the
@@ -493,6 +503,7 @@ pub fn inspect(
             module,
             can_id: can.and_then(|c| c.can_id),
             can_id_hex: can.and_then(|c| c.can_id).map(|id| format!("0x{id:X}")),
+            extended: can.is_some_and(|c| c.extended),
             dlc: can.and_then(|c| c.dlc),
             direction: can.and_then(|c| c.transmit).map(|d| {
                 match d {

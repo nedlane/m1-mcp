@@ -326,6 +326,8 @@ fn format_reads_brace_style_from_project_config() {
 // ---- CAN model (m1_can) ---------------------------------------------------
 
 /// A DBC module declaring one or more `(message, can_id)` frames, as a `.m1dbc`.
+/// `CANId` is written the way MoTeC writes it — hexadecimal without a prefix —
+/// so the `can_id` each test passes round-trips through the hex parse.
 fn m1dbc(module: &str, messages: &[(&str, u32)]) -> String {
     let mut s = String::from("<?xml version=\"1.0\"?>\n<DBC>\n <ComponentStream>\n  <List>\n");
     s.push_str(&format!(
@@ -334,7 +336,7 @@ fn m1dbc(module: &str, messages: &[(&str, u32)]) -> String {
     for (msg, id) in messages {
         s.push_str(&format!(
             "   <Component Classname=\"BuiltIn.CAN.Message\" Name=\"{module}.{msg}\">\n\
-             \x20   <Props CANId=\"{id}\" DLC=\"8\" Transmit=\"RX\" Endian=\"Little\"/>\n\
+             \x20   <Props CANId=\"{id:X}\" DLC=\"8\" Transmit=\"RX\" Endian=\"Little\"/>\n\
              \x20  </Component>\n"
         ));
     }
@@ -614,6 +616,60 @@ fn can_lists_messages_with_id_direction_and_bus() {
     assert!(
         out.guidance.iter().any(|g| g.contains("Init")),
         "guidance must state the Init/bus rule"
+    );
+}
+
+// The `.m1dbc` stores CAN ids in hex without a prefix, so a lettered id like
+// the DTI corpus's `CANId="4B3"` must be recognised (the old decimal parse
+// dropped it entirely), and `IdType="Extended"` must surface on the message.
+#[test]
+fn can_reads_hex_lettered_and_extended_ids() {
+    let (_dir, project) = can_fixture();
+    let dbc_dir = project.parent().unwrap().join("dbc");
+    let mut xml = String::from(
+        "<?xml version=\"1.0\"?>\n<DBC>\n <ComponentStream>\n  <List>\n\
+         \x20  <Component Classname=\"BuiltIn.CAN.DBC\" Name=\"Kappa\"/>\n\
+         \x20  <Component Classname=\"BuiltIn.CAN.Message\" Name=\"Kappa.Lettered\">\n\
+         \x20   <Props CANId=\"4B3\" DLC=\"8\" Transmit=\"RX\"/>\n\
+         \x20  </Component>\n\
+         \x20  <Component Classname=\"BuiltIn.CAN.Message\" Name=\"Kappa.Wide\">\n\
+         \x20   <Props IdType=\"Extended\" CANId=\"2968\" DLC=\"8\" Transmit=\"RX\"/>\n\
+         \x20  </Component>\n",
+    );
+    xml.push_str("  </List>\n </ComponentStream>\n</DBC>\n");
+    std::fs::write(dbc_dir.join("Kappa.m1dbc"), xml).unwrap();
+    // Register the module in the .m1prj the way the real corpora do.
+    let prj = std::fs::read_to_string(&project).unwrap().replace(
+        "<Component Classname=\"BuiltIn.CAN.DBCRoot\" Name=\"DBC\"/>",
+        "<Component Classname=\"BuiltIn.CAN.DBCRoot\" Name=\"DBC\"/>\n    \
+         <Component Classname=\"BuiltIn.CAN.DBC\" Name=\"DBC.Kappa\"/>",
+    );
+    std::fs::write(&project, prj).unwrap();
+
+    let out = can::inspect(&project, Some("kappa"), 0).expect("can inspect runs");
+    let lettered = out
+        .messages
+        .iter()
+        .find(|m| m.path == "Kappa.Lettered")
+        .expect("a hex-lettered CANId must not be dropped");
+    assert_eq!(lettered.can_id, Some(0x4B3));
+    assert_eq!(lettered.can_id_hex.as_deref(), Some("0x4B3"));
+    assert!(!lettered.extended);
+
+    let wide = out
+        .messages
+        .iter()
+        .find(|m| m.path == "Kappa.Wide")
+        .unwrap();
+    assert_eq!(wide.can_id, Some(0x2968), "hex, not decimal 2968");
+    assert!(wide.extended, "IdType=\"Extended\" surfaces on the message");
+
+    // The guidance spells the hex rule out for agents reading raw XML.
+    assert!(
+        out.guidance
+            .iter()
+            .any(|g| g.to_lowercase().contains("hex")),
+        "guidance must state that .m1dbc ids are hexadecimal"
     );
 }
 
