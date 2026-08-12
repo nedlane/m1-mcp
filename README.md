@@ -20,10 +20,67 @@ having the CLIs installed on your `PATH`.
 | `m1_lint` | Lint M1 source with the default M1 rule set (the `L0xx` rules). |
 | `m1_format` | Format M1 source to the M1 style, or (in `check_only` mode) just report whether it is already formatted. |
 | `m1_symbols` | Load a `Project.m1prj` and list its workspace symbols — channels, parameters, constants, functions, tables, objects — with kind, value type, unit and security. |
+| `m1_can` | Inspect a project's CAN setup: every `.m1dbc` module with the bus a script binds it to, every message with its CAN id, and each repeated id judged `same-bus`, `different-bus` or `unknown`. |
+
+### Checking CAN
+
+A `.m1dbc` carries no CAN bus of its own. A script binds it with
+`DBC.<Name>.Init(<bus>)` — conventionally all in one `CAN Init` script — and a
+DBC that is used but never initialised is M1 Build **Error 1375** (the
+`m1-typecheck` **T107** rule). CAN identifiers are therefore *per bus*: the same
+id on two different buses is not a conflict.
+
+That is easy to get wrong by reading the `.m1dbc` files alone, which is what
+`m1_can` exists for. It reports each module's bus binding (with the `Init` call
+site) and classifies every repeated CAN id:
+
+- **`same-bus`** — a real clash: two messages with that id on one bus.
+- **`different-bus`** — proven safe. The real EV corpus relies on this:
+  `SBG DBC.Init(2)` and `DTI FSIC RL.Init(1)` both declare ids 133/173.
+- **`unknown`** — at least one module is uninitialised, or its bus is a symbol
+  the project carries no value for, so nothing is proven either way. Report it
+  as unknown; do not guess.
+
+A bus argument that names a symbol is **resolved to a number** where the project
+knows one — a constant's `.m1prj` `Value`, or a parameter's cell in
+`parameters.m1cfg` — and that number is reported as `bus_value`. So AV-M1's
+`DBC.Dash.Init(Active Bus)` reads as bus 0 and `DBC.Datalogger.Init(Datalogger
+Bus)` as bus 2, rather than two opaque names.
+
+A value that came from the `.m1cfg` is the project's **current calibration**, so
+a verdict resting on one is marked `depends_on_calibration: true`: it holds for
+the loaded calibration and a retune can change it. Verdicts from literals and
+project constants alone are retune-proof. Two modules bound to the *same* symbol
+are the same bus either way.
 
 The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary
 MoTeC M1 Development Manual.
+
+## Scope and limits
+
+`m1-mcp` is an **analysis and format bridge** — it lets an agent look up M1
+semantics and run the read-only analysers (`m1_doc_search`, `m1_doc_lookup`,
+`m1_typecheck`, `m1_lint`, `m1_format`, `m1_symbols`, `m1_can`) over the code it
+writes.
+It is **not** full toolchain parity: it does not evaluate M1 scripts, does not
+mutate projects or write files back, and does not generate docs or
+visualisations. Use the individual CLIs (or the LSP/editor integrations) for
+those.
+
+Because the server speaks MCP over **stdio** on a single process, every request
+is bounded so no one call can monopolise it:
+
+- **Inline `source` and file reads** are capped at **2 MiB** per request; a
+  larger payload (or a `path` to a larger file, rejected on its size before it
+  is read) returns a structured error naming the limit.
+- **Project-wide operations** (`m1_typecheck` given a `project`, `m1_symbols`
+  and `m1_can`) walk at most **2000** `.m1scr` files; a larger project tree is
+  rejected before it is loaded.
+
+The limits are compile-time constants (see `src/limits.rs`), sized well above
+any realistic interactive request — a project that hits them should be run
+through the CLI directly.
 
 ## Install
 
