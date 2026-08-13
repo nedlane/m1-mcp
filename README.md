@@ -22,6 +22,10 @@ having the CLIs installed on your `PATH`.
 | `m1_symbols` | Load a `Project.m1prj` and list its workspace symbols — channels, parameters, constants, functions, tables, objects — with kind, value type, unit and security. |
 | `m1_can` | Inspect a project's CAN setup: every `.m1dbc` module with the bus a script binds it to, every message with its CAN id, and each repeated id judged `same-bus`, `different-bus` or `unknown`. |
 
+The `m1_can` handler delegates in-process to the versioned
+[`m1-can`](https://github.com/nedlane/m1-can) library. The CLI, MCP server, and
+other consumers therefore share one bus-binding and overlap implementation.
+
 ### Checking CAN
 
 A `.m1dbc` carries no CAN bus of its own. A script binds it with
