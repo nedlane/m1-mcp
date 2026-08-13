@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::analyze::{self, Input};
-use crate::{can, doc, symbols};
+use crate::{doc, symbols};
 
 /// Guidance surfaced to the agent on connect.
 const INSTRUCTIONS: &str = "\
@@ -231,8 +231,8 @@ impl M1Server {
     async fn m1_can(
         &self,
         Parameters(p): Parameters<CanParams>,
-    ) -> Result<Json<can::CanOutcome>, ErrorData> {
-        can::inspect(
+    ) -> Result<Json<m1_can::CanOutcome>, ErrorData> {
+        m1_can::inspect(
             &PathBuf::from(&p.project),
             p.filter.as_deref(),
             p.limit.unwrap_or(200),

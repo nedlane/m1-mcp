@@ -15,7 +15,7 @@ the code it writes.
 
 A single binary on the official Rust MCP SDK (`rmcp`, stdio transport). It
 depends on the toolchain **library crates** (`m1-typecheck`, `m1-lint`,
-`m1-fmt`) via versioned git tags and calls them **in-process** — there is no
+`m1-fmt`, `m1-can`) via versioned git tags and calls them **in-process** — there is no
 PATH dependency on installed CLIs.
 
 - `doc` — reference over `m1-typecheck`'s intrinsics catalogue (`m1_doc_search`,
@@ -23,9 +23,9 @@ PATH dependency on installed CLIs.
 - `analyze` — runs the analysers over agent-supplied source (`m1_typecheck`,
   `m1_lint`, `m1_format`).
 - `symbols` — lists a project's workspace symbols (`m1_symbols`).
-- `can` — reconstructs the project's CAN picture (`m1_can`): which `.m1dbc`
+- `m1-can` — supplies the shared CAN picture behind `m1_can`: which `.m1dbc`
   module a script binds to which bus via `DBC.<Name>.Init(<bus>)`, and whether a
-  repeated CAN id is a real clash.
+  repeated CAN id is a real clash. Keep that logic in the shared crate.
 - `server` — the `rmcp` tool router wiring the above; each tool returns
   structured JSON.
 
