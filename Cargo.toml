@@ -1,6 +1,6 @@
 [package]
 name = "m1-mcp"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 description = "Model Context Protocol server exposing the MoTeC M1 toolchain to AI agents"
 license = "GPL-3.0-or-later"
@@ -25,7 +25,7 @@ m1-typecheck = { git = "https://github.com/C-Nucifora/m1-typecheck.git", tag = "
 m1-lint = { git = "https://github.com/C-Nucifora/m1-lint.git", tag = "v0.24.1" }
 m1-fmt = { git = "https://github.com/C-Nucifora/m1-fmt.git", tag = "v0.17.1" }
 m1-workspace = { git = "https://github.com/nedlane/m1-workspace.git", tag = "v0.13.0" }
-m1-can = { git = "https://github.com/nedlane/m1-can.git", tag = "v0.2.0" }
+m1-can = { git = "https://github.com/nedlane/m1-can.git", tag = "v0.2.1" }
 
 [dev-dependencies]
 tempfile = "3"
