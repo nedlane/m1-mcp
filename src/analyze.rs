@@ -174,14 +174,25 @@ fn resolve_related_path_v050(
         )
     })?;
 
-    let tokens: Vec<&str> = related.message.split('`').skip(1).step_by(2).collect();
+    // Producers may quote descriptive values first (T098 quotes the argument
+    // name), but every v0.50.0 producer puts the defining symbol last.
+    let token = related
+        .message
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .last()
+        .ok_or_else(|| {
+            format!(
+                "{} related location at project line {} does not name a defining symbol",
+                diagnostic.code.as_str(),
+                line + 1
+            )
+        })?;
     let mut symbol_paths: Vec<String> = Vec::new();
-    for token in tokens {
-        if let Some(symbol) = project.symbols().get(token) {
-            symbol_paths.push(symbol.path.clone());
-            continue;
-        }
-
+    if let Some(symbol) = project.symbols().get(token) {
+        symbol_paths.push(symbol.path.clone());
+    } else {
         // A few producers render a path relative to the checked script's
         // group (for example `Helper` for `Root.Ctrl.Helper`). Only pay for a
         // suffix scan when the structured exact lookup fails.

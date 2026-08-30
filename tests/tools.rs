@@ -213,7 +213,7 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
     <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
     <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.m1scr" Name="Root.Ctrl.Helper">
      <Signature Name="" ReturnType="f32">
-      <Params><Param Name="Input" Type="f32" Attrs="0"/></Params>
+      <Params><Param Name="BusA" Type="f32" Attrs="0"/></Params>
      </Signature>
     </Component>
     <Component Classname="BuiltIn.FuncUser" Filename="Caller.m1scr" Name="Root.Ctrl.Caller"/>
@@ -231,6 +231,8 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
 <DBC>
  <ComponentStream>
   <List>
+
+
    <Component Classname="BuiltIn.CAN.DBC" Name="{root}"/>
    <Component Classname="BuiltIn.CAN.Message" Name="{root}.Frame"><Props CANId="100" DLC="8"/></Component>
    <Component Classname="BuiltIn.CAN.Signal" Name="{root}.Frame.Count"><Props Type="u32" StartBit="0" Length="10"/></Component>
@@ -251,6 +253,8 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
         "BusB.Frame.Count = 1.5;\nlocal result = Helper();\n",
     )
     .unwrap();
+    let helper = dir.path().join("Helper.m1scr");
+    std::fs::write(&helper, "Out = 1.0;\n").unwrap();
 
     let out = analyze::typecheck(&Input::Path(caller), Some(&project)).expect("typecheck runs");
     let assignment = out
@@ -279,6 +283,19 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
         arity.related[0].path,
         dir.path().join("Helper.m1scr").display().to_string()
     );
+
+    // T098 quotes both the unused argument (`BusA`) and the defining function.
+    // The DBC root deliberately shares the function's declaration line, so
+    // provenance resolution must use the final defining-symbol token.
+    let helper_out =
+        analyze::typecheck(&Input::Path(helper), Some(&project)).expect("typecheck runs");
+    let unused = helper_out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T098")
+        .unwrap_or_else(|| panic!("unused BusA argument should produce T098: {helper_out:?}"));
+    assert_eq!(unused.related.len(), 1);
+    assert_eq!(unused.related[0].path, project.display().to_string());
 }
 
 #[test]
