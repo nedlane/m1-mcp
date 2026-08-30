@@ -637,6 +637,20 @@ fn lint_skips_project_excluded_paths_before_diagnostics_or_fixes() {
     assert!(skipped.excluded);
     assert!(skipped.diagnostics.is_empty());
     assert!(skipped.fix.is_none());
+
+    // Inline bytes are request-owned and must remain capped even when the
+    // logical context path matches the same exclusion. Only file reads are
+    // bypassed by exclusion.
+    let oversized_inline = "A".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize + 1);
+    let err = analyze::lint(
+        &inline_at(oversized_inline, dir.path().join("inline.generated.m1scr")),
+        false,
+    )
+    .expect_err("excluded inline source must still respect the request cap");
+    assert!(
+        err.contains("exceeds") && err.contains("per-request limit"),
+        "inline exclusion must not bypass the cap: {err}"
+    );
 }
 
 #[test]

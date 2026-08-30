@@ -581,6 +581,15 @@ fn lint_fix_outcome(result: Result<Option<String>, m1_lint::fix::FixError>) -> L
 /// runner computes a safe fixed point and returns it without writing path
 /// input. Syntax errors bypass fixing.
 pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
+    // Excluded file-backed paths must be skipped before any read, but inline
+    // bytes already belong to the request and always remain subject to the
+    // request cap—even when their logical context path matches an exclusion.
+    if let Input::Inline { source, .. } = input {
+        let len = source.len() as u64;
+        if len > limits::MAX_REQUEST_SOURCE_BYTES {
+            return Err(over_limit_msg("inline `source`", len));
+        }
+    }
     let path = match input {
         Input::Inline { context_path, .. } => context_path.as_deref(),
         Input::Path(path) => Some(path.as_path()),
