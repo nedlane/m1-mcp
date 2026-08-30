@@ -21,7 +21,9 @@ confirm builtin function signatures, enum spellings, and which functions are \
 calibration-only BEFORE writing M1 script — do not guess. After editing a `.m1scr`, \
 run `m1_typecheck`, `m1_lint`, and `m1_format` (check_only) on it. Pass either inline \
 `source` or a file `path`; give `project` (a Project.m1prj) to enable cross-script and \
-reference-keyword checks. `m1_symbols` lists a project's channels/parameters/functions.
+reference-keyword checks. `m1_lint` can return a safe fixed source without writing the file; \
+use `m1_lint_rule` for the rationale and fix behavior of an exact L-code. `m1_symbols` lists a \
+project's channels/parameters/functions.
 CAN: never judge CAN traffic from the `.m1dbc` files alone — a DBC carries no bus until a script \
 binds it with `DBC.<Name>.Init(<bus>)` (M1 Build Error 1375 if none does), and CAN identifiers are \
 per bus. Call `m1_can` for any CAN question: it reports each DBC module's bus binding (with the \
@@ -65,13 +67,22 @@ pub struct DocLookupParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AnalyzeParams {
+pub struct LintParams {
     /// Inline M1 script text. Provide this OR `path`.
     #[serde(default)]
     pub source: Option<String>,
     /// Path to a `.m1scr` file. Provide this OR `source`.
     #[serde(default)]
     pub path: Option<String>,
+    /// Return a verified safe fixed source without writing the input file.
+    #[serde(default)]
+    pub fix: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LintRuleParams {
+    /// Exact uppercase lint rule code, such as `L004`.
+    pub code: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -177,16 +188,42 @@ impl M1Server {
             .map_err(|e| ErrorData::invalid_params(e, None))
     }
 
-    /// Lint M1 script with the default rule set, returning diagnostics.
+    /// Lint M1 script with the resolved rule set, optionally returning a safe
+    /// fixed source.
     #[tool(
-        description = "Lint M1 script (inline `source` or a file `path`) with the default M1 rule set, returning source-scoped L0xx diagnostics with paths and exact position/byte ranges."
+        description = "Lint M1 script (inline `source` or a read-only file `path`) with the project-configured rule set. Findings include source paths, exact position/byte ranges, stable rule names, and fixability. Set `fix: true` to return a verified safe fixed source; files are never written and syntax errors are never fixed.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn m1_lint(
         &self,
-        Parameters(p): Parameters<AnalyzeParams>,
+        Parameters(p): Parameters<LintParams>,
     ) -> Result<Json<analyze::LintOutcome>, ErrorData> {
         let input = make_input(p.source, p.path)?;
-        analyze::lint(&input)
+        analyze::lint(&input, p.fix)
+            .map(Json)
+            .map_err(|e| ErrorData::invalid_params(e, None))
+    }
+
+    /// Look up metadata and the full explanation for one exact lint rule code.
+    #[tool(
+        description = "Look up one exact M1 lint L-code. Returns its stable name, severity, default state, fixability, summary, and full explanation.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn m1_lint_rule(
+        &self,
+        Parameters(p): Parameters<LintRuleParams>,
+    ) -> Result<Json<analyze::LintRuleMetadata>, ErrorData> {
+        analyze::lint_rule(&p.code)
             .map(Json)
             .map_err(|e| ErrorData::invalid_params(e, None))
     }
@@ -253,5 +290,37 @@ impl ServerHandler for M1Server {
         info.server_info.name = "m1-mcp".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::M1Server;
+
+    #[test]
+    fn lint_tools_publish_read_only_object_schemas() {
+        let tools = M1Server::tool_router().list_all();
+        for name in ["m1_lint", "m1_lint_rule"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing {name} tool"));
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&serde_json::json!("object"))
+            );
+            let output = tool.output_schema.as_ref().expect("output schema");
+            assert_eq!(output.get("type"), Some(&serde_json::json!("object")));
+            let annotations = tool.annotations.as_ref().expect("tool annotations");
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            let expected_input = if name == "m1_lint" { "fix" } else { "code" };
+            assert!(
+                tool.input_schema["properties"]
+                    .as_object()
+                    .is_some_and(|properties| properties.contains_key(expected_input)),
+                "{name} input schema missing {expected_input}"
+            );
+        }
     }
 }

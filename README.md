@@ -17,7 +17,8 @@ having the CLIs installed on your `PATH`.
 | `m1_doc_search` | Search the M1 builtin catalogue — library functions, project-object methods, firmware enumerations, package classes, data types — and get ranked matches with signatures and docs. |
 | `m1_doc_lookup` | Full detail for one exact builtin name: every overload of a function, all members of an enum, a class summary, or a data type. |
 | `m1_typecheck` | Type-check M1 source (inline text or a file path), returning diagnostics with code, severity and line/column. Pass a `Project.m1prj` to enable cross-script and reference-keyword checks. |
-| `m1_lint` | Lint M1 source with the default M1 rule set (the `L0xx` rules). |
+| `m1_lint` | Lint M1 source with the project-configured `L0xx` rules. Findings include stable rule names and fixability. Optional fix mode returns verified fixed text without writing files. |
+| `m1_lint_rule` | Look up one exact `L0xx` code and return its severity, default state, fixability, summary, and full explanation. |
 | `m1_format` | Format M1 source to the M1 style, or (in `check_only` mode) just report whether it is already formatted. |
 | `m1_symbols` | Load a `Project.m1prj` and list its workspace symbols — channels, parameters, constants, functions, tables, objects — with kind, value type, unit and security. |
 | `m1_can` | Inspect a project's CAN setup: every `.m1dbc` module with the bus a script binds it to, every message with its CAN id, and each repeated id judged `same-bus`, `different-bus` or `unknown`. |
@@ -61,12 +62,36 @@ The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary
 MoTeC M1 Development Manual.
 
+### Lint fixes and rule details
+
+Path input discovers the same `m1-tools.toml` and `.m1lint.toml` settings as
+the CLI. Inline source uses the default rule set.
+
+`m1_lint` accepts `fix: true`. It runs the pinned linter's safe fixed-point
+fixer with the same project configuration used to produce the findings. The
+diagnostics describe the submitted source, and the separate `fix` result has
+one of three explicit outcomes:
+
+- `unchanged`: no enabled fix changed valid source, or syntax errors prevented
+  the fixer from running.
+- `fixed`: `source` contains the verified fixed text.
+- `unsafe`: `error` explains why the linter rejected the rewrite.
+
+A path remains read-only in every case. The server returns text and never
+writes it back. Each lint finding includes `name` and `fixable`; parser
+diagnostics use `name: "syntax-error"` and `fixable: false`. Both kinds retain
+the submitted source identity and exact position and byte ranges.
+
+Call `m1_lint_rule` with an exact uppercase code such as `L004` to get the
+stable rule name, default severity, whether it is enabled by default, whether
+it is fixable, its one-line summary, and the linter's full explanation.
+
 ## Scope and limits
 
 `m1-mcp` is an **analysis and format bridge** — it lets an agent look up M1
 semantics and run the read-only analysers (`m1_doc_search`, `m1_doc_lookup`,
-`m1_typecheck`, `m1_lint`, `m1_format`, `m1_symbols`, `m1_can`) over the code it
-writes.
+`m1_typecheck`, `m1_lint`, `m1_lint_rule`, `m1_format`, `m1_symbols`, `m1_can`)
+over the code it writes.
 It is **not** full toolchain parity: it does not evaluate M1 scripts, does not
 mutate projects or write files back, and does not generate docs or
 visualisations. Use the individual CLIs (or the LSP/editor integrations) for
