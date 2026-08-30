@@ -191,7 +191,7 @@ impl M1Server {
     /// Lint M1 script with the resolved rule set, optionally returning a safe
     /// fixed source.
     #[tool(
-        description = "Lint M1 script (inline `source` or a read-only file `path`) with the project-configured rule set. Findings include source paths, exact position/byte ranges, stable rule names, and fixability. Set `fix: true` to return a verified safe fixed source; files are never written and syntax errors are never fixed.",
+        description = "Lint M1 script (inline `source` or a read-only file `path`) with the project-configured rule set. A path matching configured exclude globs returns `excluded: true` without being read or fixed. Findings include source paths, exact position/byte ranges, stable rule names, and fixability. Set `fix: true` to return a verified safe fixed source; files are never written and syntax errors are never fixed.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

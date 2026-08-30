@@ -49,7 +49,7 @@ agent (Claude Code / Cursor)  ──stdio/JSON-RPC──▶  m1-mcp
 | `m1_doc_search` | `m1_typecheck::intrinsics` | Fuzzy/substring search across builtin functions, enums, classes, types → ranked matches with kind, signature, doc snippet. **The headline: agents cite real M1 semantics instead of guessing.** |
 | `m1_doc_lookup` | `m1_typecheck::intrinsics` | Exact lookup of one builtin name → full detail (all overloads, params + types, enum members, class doc). |
 | `m1_typecheck` | `m1_typecheck::rules::check_script` | Type-check M1 source (inline text or file path; optional `Project.m1prj` root for cross-references) → diagnostics (code, severity, line/col, message). |
-| `m1_lint` | `m1_lint::runner::Runner` | Lint M1 source with the configured rule set and optionally return safe fixed text. Findings carry stable rule names and fixability. |
+| `m1_lint` | `m1_lint::runner::Runner` | Lint M1 source with the configured rule set and optionally return safe fixed text. Findings carry stable rule names and fixability; configured path exclusions are reported without reading or fixing the file. |
 | `m1_lint_rule` | `m1_lint::diagnostic::LintCode` | Exact L-code lookup with default severity/state, fixability, summary, and explanation. |
 | `m1_format` | `m1_fmt::format_str` | Format M1 source → formatted text + any warnings; `check_only` mode reports whether it is already formatted. |
 | `m1_symbols` | `m1_typecheck::Project` | Load a project and list its workspace symbols (path, kind, type, unit, security), optional name substring filter. |

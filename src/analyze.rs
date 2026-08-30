@@ -436,6 +436,10 @@ pub struct LintOutcome {
     pub diagnostics: Vec<LintDiagnosticDto>,
     pub error_count: usize,
     pub warning_count: usize,
+    /// True when a path input matched the resolved lint configuration's
+    /// `exclude` globs. Excluded files are not read, parsed, diagnosed, or
+    /// fixed, matching the `m1-lint` CLI.
+    pub excluded: bool,
     /// Present when the caller requested a safe, read-only fix.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<LintFixOutcome>,
@@ -468,7 +472,7 @@ impl std::ops::Deref for LintDiagnosticDto {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LintFixOutcome {
     /// No enabled safe fix changed the source, including when syntax errors
-    /// prevent the fixer from running.
+    /// prevent the fixer from running or the path is excluded.
     Unchanged,
     /// The source after `fix_source_stable` reached a safe fixed point.
     Fixed { source: String },
@@ -502,11 +506,13 @@ fn lint_dto(
     }
 }
 
-/// Resolve the effective project lint registry in the same order as the
+/// Resolve the effective project lint configuration in the same order as the
 /// `m1-lint` CLI: defaults, unified `m1-tools.toml`, then `.m1lint.toml`.
-fn lint_registry(path: Option<&Path>) -> Result<m1_lint::registry::Registry, String> {
+/// Keep the `Config` until exclusion is checked; converting it directly to a
+/// `Registry` would discard its path globs.
+fn lint_config(path: Option<&Path>) -> Result<m1_lint::config::Config, String> {
     let Some(dir) = path.and_then(Path::parent) else {
-        return Ok(m1_lint::registry::Registry::default());
+        return Ok(m1_lint::config::Config::default());
     };
 
     let mut config = m1_lint::config::Config::default();
@@ -518,7 +524,7 @@ fn lint_registry(path: Option<&Path>) -> Result<m1_lint::registry::Registry, Str
     config
         .apply_discovered_file(dir)
         .map_err(|error| error.to_string())?;
-    Ok(m1_lint::registry::Registry::from_config(&config))
+    Ok(config)
 }
 
 fn lint_fix_outcome(result: Result<Option<String>, m1_lint::fix::FixError>) -> LintFixOutcome {
@@ -538,10 +544,25 @@ fn lint_fix_outcome(result: Result<Option<String>, m1_lint::fix::FixError>) -> L
 /// same configured runner computes a safe fixed point and returns it without
 /// writing path input. Syntax errors bypass fixing.
 pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
+    let path = match input {
+        Input::Inline(_) => None,
+        Input::Path(path) => Some(path.as_path()),
+    };
+    let config = lint_config(path)?;
+    if path.is_some_and(|path| config.is_excluded(path)) {
+        return Ok(LintOutcome {
+            diagnostics: Vec::new(),
+            error_count: 0,
+            warning_count: 0,
+            excluded: true,
+            fix: fix.then_some(LintFixOutcome::Unchanged),
+        });
+    }
+
     let (source, path) = input.resolve()?;
     let input_source = source_dto(path);
 
-    let registry = lint_registry(path)?;
+    let registry = m1_lint::registry::Registry::from_config(&config);
     let runner = m1_lint::runner::Runner::new(registry);
     let run = runner.run_source(&source);
 
@@ -575,6 +596,7 @@ pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
         diagnostics,
         error_count,
         warning_count,
+        excluded: false,
         fix,
     })
 }

@@ -380,6 +380,7 @@ fn lint_returns_consistent_counts() {
         .filter(|d| d.severity == "warning")
         .count();
     assert_eq!(out.warning_count, warns);
+    assert!(!out.excluded);
     assert!(out.fix.is_none(), "no fix was requested");
 }
 
@@ -472,6 +473,41 @@ fn lint_path_fix_is_returned_without_writing_the_file() {
 }
 
 #[test]
+fn lint_skips_project_excluded_paths_before_diagnostics_or_fixes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".m1lint.toml"),
+        "exclude = [\"*.generated.m1scr\"]\n",
+    )
+    .unwrap();
+    let path = dir.path().join("model.generated.m1scr");
+    let source = "Result = A == B;\n";
+    std::fs::write(&path, source).unwrap();
+
+    let out = analyze::lint(&Input::Path(path.clone()), true).expect("excluded path is skipped");
+    assert!(out.excluded);
+    assert!(out.diagnostics.is_empty());
+    assert_eq!((out.error_count, out.warning_count), (0, 0));
+    assert_eq!(out.fix, Some(LintFixOutcome::Unchanged));
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        source,
+        "an excluded path must not be fixed or written"
+    );
+
+    // Prove exclusion happens before `Input::resolve`: an otherwise rejected
+    // oversized path is still skipped, exactly as the CLI skips before reads.
+    let oversized = dir.path().join("large.generated.m1scr");
+    let file = std::fs::File::create(&oversized).unwrap();
+    file.set_len(limits::MAX_REQUEST_SOURCE_BYTES + 1).unwrap();
+    let skipped = analyze::lint(&Input::Path(oversized), false)
+        .expect("excluded file must not be read or size-checked");
+    assert!(skipped.excluded);
+    assert!(skipped.diagnostics.is_empty());
+    assert!(skipped.fix.is_none());
+}
+
+#[test]
 fn lint_fix_uses_the_same_project_config_as_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -543,6 +579,7 @@ fn lint_tool_schemas_expose_fix_and_rule_metadata() {
     for field in [
         "name",
         "fixable",
+        "excluded",
         "scope",
         "source",
         "end_line",

@@ -65,7 +65,9 @@ MoTeC M1 Development Manual.
 ### Lint fixes and rule details
 
 Path input discovers the same `m1-tools.toml` and `.m1lint.toml` settings as
-the CLI. Inline source uses the default rule set.
+the CLI. A path matching the configured `exclude` globs is not read, parsed or
+fixed; the result has `excluded: true`, empty diagnostics and, when a fix was
+requested, an `unchanged` fix outcome. Inline source uses the default rule set.
 
 `m1_lint` accepts `fix: true`. It runs the pinned linter's safe fixed-point
 fixer with the same project configuration used to produce the findings. The
