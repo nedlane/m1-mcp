@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use m1_core::{Diagnostic, Severity};
+use m1_lint::diagnostic::LintCode;
 use m1_typecheck::cross_script::{self, ChannelTaints};
 use m1_typecheck::diagnostics::{RelatedLocation, RelatedPlace, TypeDiagnostic};
 use m1_typecheck::project::Project;
@@ -432,46 +433,148 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
 /// The outcome of linting one script.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LintOutcome {
-    pub diagnostics: Vec<DiagnosticDto>,
+    pub diagnostics: Vec<LintDiagnosticDto>,
     pub error_count: usize,
     pub warning_count: usize,
+    /// True when a path input matched the resolved lint configuration's
+    /// `exclude` globs. Excluded files are not read, parsed, diagnosed, or
+    /// fixed, matching the `m1-lint` CLI.
+    pub excluded: bool,
+    /// Present when the caller requested a safe, read-only fix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<LintFixOutcome>,
+}
+
+/// A lint diagnostic with stable rule metadata. Syntax diagnostics use the
+/// synthetic `syntax-error` name and are never fixable.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LintDiagnosticDto {
+    /// The common diagnostic provenance and exact range fields.
+    #[serde(flatten)]
+    pub diagnostic: DiagnosticDto,
+    /// Stable rule name (`eq-operator-preferred`, or `syntax-error`).
+    pub name: String,
+    /// Whether the pinned linter has a verified mechanical fix for this rule.
+    pub fixable: bool,
+}
+
+impl std::ops::Deref for LintDiagnosticDto {
+    type Target = DiagnosticDto;
+
+    fn deref(&self) -> &Self::Target {
+        &self.diagnostic
+    }
+}
+
+/// Result of a requested lint fix. Fixing is read-only: `source` is returned
+/// to the caller and a path input is never written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum LintFixOutcome {
+    /// No enabled safe fix changed the source, including when syntax errors
+    /// prevent the fixer from running or the path is excluded.
+    Unchanged,
+    /// The source after `fix_source_stable` reached a safe fixed point.
+    Fixed { source: String },
+    /// The linter rejected every proposed edit as unsafe.
+    Unsafe { error: String },
+}
+
+/// Static metadata for one exact lint rule code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct LintRuleMetadata {
+    pub code: String,
+    pub name: String,
+    /// The rule's severity before project-specific overrides.
+    pub severity: String,
+    pub enabled_by_default: bool,
+    pub fixable: bool,
+    pub summary: String,
+    pub explanation: String,
+}
+
+fn lint_dto(
+    code: Option<LintCode>,
+    diagnostic: &Diagnostic,
+    source: DiagnosticSourceDto,
+) -> LintDiagnosticDto {
+    let code_text = code.map_or_else(|| "syntax".to_string(), |code| code.to_string());
+    LintDiagnosticDto {
+        diagnostic: to_dto(&code_text, diagnostic, DiagnosticScope::Source, source),
+        name: code.map_or("syntax-error", |code| code.name()).to_string(),
+        fixable: code.is_some_and(|code| code.fixable()),
+    }
+}
+
+/// Resolve the effective project lint configuration in the same order as the
+/// `m1-lint` CLI: defaults, unified `m1-tools.toml`, then `.m1lint.toml`.
+/// Keep the `Config` until exclusion is checked; converting it directly to a
+/// `Registry` would discard its path globs.
+fn lint_config(path: Option<&Path>) -> Result<m1_lint::config::Config, String> {
+    let Some(dir) = path.and_then(Path::parent) else {
+        return Ok(m1_lint::config::Config::default());
+    };
+
+    let mut config = m1_lint::config::Config::default();
+    if let Some(tools) = m1_workspace::config::M1ToolsConfig::discover(dir) {
+        config
+            .apply_tools_config(&tools)
+            .map_err(|error| error.to_string())?;
+    }
+    config
+        .apply_discovered_file(dir)
+        .map_err(|error| error.to_string())?;
+    Ok(config)
+}
+
+fn lint_fix_outcome(result: Result<Option<String>, m1_lint::fix::FixError>) -> LintFixOutcome {
+    match result {
+        Ok(Some(source)) => LintFixOutcome::Fixed { source },
+        Ok(None) => LintFixOutcome::Unchanged,
+        Err(error) => LintFixOutcome::Unsafe {
+            error: error.to_string(),
+        },
+    }
 }
 
 /// Lint `input`. When it comes from a file path, the project's lint config
 /// (`.m1lint.toml` / unified `m1-tools.toml`) is discovered from that file's
 /// directory so the active rule set and thresholds match the project's CLI/CI;
-/// inline source falls back to the default rule set.
-pub fn lint(input: &Input) -> Result<LintOutcome, String> {
+/// inline source falls back to the default rule set. When `fix` is true, the
+/// same configured runner computes a safe fixed point and returns it without
+/// writing path input. Syntax errors bypass fixing.
+pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
+    let path = match input {
+        Input::Inline(_) => None,
+        Input::Path(path) => Some(path.as_path()),
+    };
+    let config = lint_config(path)?;
+    if path.is_some_and(|path| config.is_excluded(path)) {
+        return Ok(LintOutcome {
+            diagnostics: Vec::new(),
+            error_count: 0,
+            warning_count: 0,
+            excluded: true,
+            fix: fix.then_some(LintFixOutcome::Unchanged),
+        });
+    }
+
     let (source, path) = input.resolve()?;
     let input_source = source_dto(path);
 
-    let registry = match path
-        .and_then(Path::parent)
-        .and_then(|dir| m1_lint::config::Config::discover(dir).ok())
-    {
-        Some(cfg) => m1_lint::registry::Registry::from_config(&cfg),
-        None => m1_lint::registry::Registry::default(),
-    };
+    let registry = m1_lint::registry::Registry::from_config(&config);
     let runner = m1_lint::runner::Runner::new(registry);
     let run = runner.run_source(&source);
 
-    let mut diagnostics: Vec<DiagnosticDto> = run
+    let mut diagnostics: Vec<LintDiagnosticDto> = run
         .syntax_errors
         .iter()
-        .map(|diagnostic| {
-            to_dto(
-                "syntax",
-                diagnostic,
-                DiagnosticScope::Source,
-                input_source.clone(),
-            )
-        })
+        .map(|diagnostic| lint_dto(None, diagnostic, input_source.clone()))
         .collect();
     diagnostics.extend(run.diagnostics.iter().map(|diagnostic| {
-        to_dto(
-            &diagnostic.code.to_string(),
+        lint_dto(
+            Some(diagnostic.code),
             &diagnostic.inner,
-            DiagnosticScope::Source,
             input_source.clone(),
         )
     }));
@@ -481,11 +584,36 @@ pub fn lint(input: &Input) -> Result<LintOutcome, String> {
         .iter()
         .filter(|d| d.severity == "warning")
         .count();
+    let fix = fix.then(|| {
+        if run.syntax_errors.is_empty() {
+            lint_fix_outcome(runner.fix_source_stable(&source))
+        } else {
+            LintFixOutcome::Unchanged
+        }
+    });
 
     Ok(LintOutcome {
         diagnostics,
         error_count,
         warning_count,
+        excluded: false,
+        fix,
+    })
+}
+
+/// Look up the pinned linter's metadata and full explanation for an exact
+/// uppercase L-code such as `L004`.
+pub fn lint_rule(code: &str) -> Result<LintRuleMetadata, String> {
+    let code = LintCode::from_code_str(code)
+        .ok_or_else(|| format!("unknown lint rule `{code}`; expected an exact L-code"))?;
+    Ok(LintRuleMetadata {
+        code: code.to_string(),
+        name: code.name().to_string(),
+        severity: code.severity().to_string(),
+        enabled_by_default: !code.off_by_default(),
+        fixable: code.fixable(),
+        summary: code.summary().to_string(),
+        explanation: m1_lint::report::explain(code).to_string(),
     })
 }
 
@@ -625,4 +753,19 @@ pub fn format(input: &Input, check_only: bool) -> Result<FormatOutcome, String> 
         },
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LintFixOutcome, lint_fix_outcome};
+
+    #[test]
+    fn rejected_linter_fix_maps_to_unsafe_outcome() {
+        assert_eq!(
+            lint_fix_outcome(Err(m1_lint::fix::FixError::TokensChanged)),
+            LintFixOutcome::Unsafe {
+                error: "fix would change program semantics".to_string(),
+            }
+        );
+    }
 }

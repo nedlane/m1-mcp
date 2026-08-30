@@ -2,7 +2,7 @@
 //! in-process analyser functions directly (the same functions the MCP tools
 //! call), asserting on the serializable DTOs.
 
-use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input};
+use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input, LintFixOutcome};
 use m1_mcp::doc::{self, DocKind};
 use m1_mcp::{limits, loader};
 
@@ -373,13 +373,255 @@ fn typecheck_identifies_project_diagnostic_path_and_subject() {
 
 #[test]
 fn lint_returns_consistent_counts() {
-    let out = analyze::lint(&Input::Inline(GOOD.to_string())).expect("lint runs");
+    let out = analyze::lint(&Input::Inline(GOOD.to_string()), false).expect("lint runs");
     let warns = out
         .diagnostics
         .iter()
         .filter(|d| d.severity == "warning")
         .count();
     assert_eq!(out.warning_count, warns);
+    assert!(!out.excluded);
+    assert!(out.fix.is_none(), "no fix was requested");
+}
+
+#[test]
+fn lint_finding_reports_name_and_fixability_and_returns_safe_fix() {
+    let out =
+        analyze::lint(&Input::Inline("Result = A == B;\n".to_string()), true).expect("lint runs");
+    let finding = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "L004")
+        .expect("L004 finding");
+    assert_eq!(finding.name, "eq-operator-preferred");
+    assert!(finding.fixable);
+    assert_eq!(finding.scope, DiagnosticScope::Source);
+    assert_eq!(finding.source, DiagnosticSourceDto::Inline);
+    assert!(finding.byte_end > finding.byte_start);
+    assert!(finding.end_line >= finding.line);
+    assert!(finding.subject.is_none());
+    assert!(finding.related.is_empty());
+    assert_eq!(
+        out.fix,
+        Some(LintFixOutcome::Fixed {
+            source: "Result = A eq B;\n".to_string(),
+        })
+    );
+}
+
+#[test]
+fn unfixable_lint_finding_returns_unchanged() {
+    let source = format!("// {}\n", "x".repeat(90));
+    let out = analyze::lint(&Input::Inline(source), true).expect("lint runs");
+    let finding = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "L001")
+        .expect("L001 finding");
+    assert_eq!(finding.name, "line-too-long");
+    assert!(!finding.fixable);
+    assert_eq!(out.fix, Some(LintFixOutcome::Unchanged));
+}
+
+#[test]
+fn syntax_errors_bypass_lint_fixes() {
+    // The upstream fixer can repair a missing semicolon. MCP fix mode must not
+    // invoke it when the original parse has any syntax error.
+    let out = analyze::lint(&Input::Inline("Result = 1\n".to_string()), true).expect("lint runs");
+    let syntax = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "syntax")
+        .expect("syntax diagnostic");
+    assert_eq!(syntax.name, "syntax-error");
+    assert!(!syntax.fixable);
+    assert_eq!(out.fix, Some(LintFixOutcome::Unchanged));
+}
+
+#[test]
+fn lint_path_fix_is_returned_without_writing_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep the fixture independent of any user-global lint configuration.
+    std::fs::write(dir.path().join(".m1lint.toml"), "").unwrap();
+    let path = dir.path().join("read-only.m1scr");
+    let source = "Result = A == B;\n";
+    std::fs::write(&path, source).unwrap();
+
+    let out = analyze::lint(&Input::Path(path.clone()), true).expect("lint runs");
+    let finding = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "L004")
+        .expect("L004 finding");
+    assert_eq!(
+        finding.source,
+        DiagnosticSourceDto::Path {
+            path: path.display().to_string(),
+        }
+    );
+    assert_eq!(
+        out.fix,
+        Some(LintFixOutcome::Fixed {
+            source: "Result = A eq B;\n".to_string(),
+        })
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        source,
+        "lint fix mode must never write path input"
+    );
+}
+
+#[test]
+fn lint_skips_project_excluded_paths_before_diagnostics_or_fixes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".m1lint.toml"),
+        "exclude = [\"*.generated.m1scr\"]\n",
+    )
+    .unwrap();
+    let path = dir.path().join("model.generated.m1scr");
+    let source = "Result = A == B;\n";
+    std::fs::write(&path, source).unwrap();
+
+    let out = analyze::lint(&Input::Path(path.clone()), true).expect("excluded path is skipped");
+    assert!(out.excluded);
+    assert!(out.diagnostics.is_empty());
+    assert_eq!((out.error_count, out.warning_count), (0, 0));
+    assert_eq!(out.fix, Some(LintFixOutcome::Unchanged));
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        source,
+        "an excluded path must not be fixed or written"
+    );
+
+    // Prove exclusion happens before `Input::resolve`: an otherwise rejected
+    // oversized path is still skipped, exactly as the CLI skips before reads.
+    let oversized = dir.path().join("large.generated.m1scr");
+    let file = std::fs::File::create(&oversized).unwrap();
+    file.set_len(limits::MAX_REQUEST_SOURCE_BYTES + 1).unwrap();
+    let skipped = analyze::lint(&Input::Path(oversized), false)
+        .expect("excluded file must not be read or size-checked");
+    assert!(skipped.excluded);
+    assert!(skipped.diagnostics.is_empty());
+    assert!(skipped.fix.is_none());
+}
+
+#[test]
+fn lint_fix_uses_the_same_project_config_as_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        "[diagnostics]\nselect = [\"L004\"]\n",
+    )
+    .unwrap();
+    // Stop user-global `.m1lint.toml` fallback from affecting the fixture.
+    std::fs::write(dir.path().join(".m1lint.toml"), "").unwrap();
+    let path = dir.path().join("configured.m1scr");
+    std::fs::write(&path, "Result = A == B && C;\n").unwrap();
+
+    let out = analyze::lint(&Input::Path(path), true).expect("lint runs");
+    assert_eq!(
+        out.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["L004"]
+    );
+    assert_eq!(
+        out.fix,
+        Some(LintFixOutcome::Fixed {
+            source: "Result = A eq B && C;\n".to_string(),
+        }),
+        "the disabled L005 rule must not rewrite `&&`"
+    );
+}
+
+#[test]
+fn lint_fix_output_is_a_stable_fixed_point() {
+    let original = "Result = A == B && C;\n";
+    let first = analyze::lint(&Input::Inline(original.to_string()), true).expect("lint runs");
+    let Some(LintFixOutcome::Fixed { source }) = first.fix else {
+        panic!("expected fixed source, got {:?}", first.fix);
+    };
+    assert_eq!(source, "Result = A eq B and C;\n");
+
+    let second = analyze::lint(&Input::Inline(source), true).expect("lint runs again");
+    assert_eq!(second.fix, Some(LintFixOutcome::Unchanged));
+}
+
+#[test]
+fn exact_lint_rule_lookup_returns_full_metadata() {
+    let rule = analyze::lint_rule("L004").expect("known exact code");
+    assert_eq!(rule.code, "L004");
+    assert_eq!(rule.name, "eq-operator-preferred");
+    assert_eq!(rule.severity, "warning");
+    assert!(rule.enabled_by_default);
+    assert!(rule.fixable);
+    assert!(!rule.summary.is_empty());
+    assert!(rule.explanation.contains("--fix rewrites"));
+
+    let opt_in = analyze::lint_rule("L017").expect("known opt-in code");
+    assert!(!opt_in.enabled_by_default);
+    assert!(!opt_in.fixable);
+    assert!(analyze::lint_rule("l004").is_err(), "lookup is exact");
+    assert!(
+        analyze::lint_rule("L013").is_err(),
+        "reserved code is unknown"
+    );
+}
+
+#[test]
+fn lint_tool_schemas_expose_fix_and_rule_metadata() {
+    let outcome = serde_json::to_value(schemars::schema_for!(analyze::LintOutcome)).unwrap();
+    assert_eq!(outcome["type"], "object");
+    let outcome_schema = outcome.to_string();
+    for field in [
+        "name",
+        "fixable",
+        "excluded",
+        "scope",
+        "source",
+        "end_line",
+        "byte_start",
+        "outcome",
+        "unchanged",
+        "fixed",
+        "unsafe",
+    ] {
+        assert!(
+            outcome_schema.contains(field),
+            "LintOutcome schema missing {field}: {outcome_schema}"
+        );
+    }
+
+    let lint_params =
+        serde_json::to_value(schemars::schema_for!(m1_mcp::server::LintParams)).unwrap();
+    assert_eq!(lint_params["type"], "object");
+    assert!(lint_params["properties"].get("fix").is_some());
+    assert!(
+        lint_params["required"]
+            .as_array()
+            .is_none_or(|required| !required.iter().any(|field| field == "fix")),
+        "fix must remain optional"
+    );
+
+    let rule = serde_json::to_value(schemars::schema_for!(analyze::LintRuleMetadata)).unwrap();
+    assert_eq!(rule["type"], "object");
+    for field in [
+        "code",
+        "name",
+        "severity",
+        "enabled_by_default",
+        "fixable",
+        "summary",
+        "explanation",
+    ] {
+        assert!(
+            rule["properties"].get(field).is_some(),
+            "LintRuleMetadata schema missing {field}"
+        );
+    }
 }
 
 #[test]
@@ -423,7 +665,7 @@ fn lint_rejects_oversized_file() {
         vec![b'A'; limits::MAX_REQUEST_SOURCE_BYTES as usize + 1],
     )
     .unwrap();
-    let err = analyze::lint(&Input::Path(scr)).expect_err("oversize file must be rejected");
+    let err = analyze::lint(&Input::Path(scr), false).expect_err("oversize file must be rejected");
     assert!(
         err.contains("exceeds") && err.contains("per-request limit"),
         "error should name the limit: {err}"
@@ -436,7 +678,7 @@ fn source_at_the_limit_is_accepted() {
     // rejected. (Newlines keep the parser cheap.)
     let at = "\n".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize);
     assert!(
-        analyze::lint(&Input::Inline(at)).is_ok(),
+        analyze::lint(&Input::Inline(at), false).is_ok(),
         "source exactly at the limit must be accepted"
     );
 }
@@ -489,7 +731,7 @@ fn typecheck_rejects_over_budget_project_before_loading() {
 #[test]
 fn analyze_errors_on_missing_input() {
     // A non-existent path is an error, not a panic.
-    let err = analyze::lint(&Input::Path("/no/such/file.m1scr".into()));
+    let err = analyze::lint(&Input::Path("/no/such/file.m1scr".into()), false);
     assert!(err.is_err(), "unreadable path should error cleanly");
 }
 
