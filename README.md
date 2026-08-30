@@ -27,6 +27,13 @@ The `m1_can` handler delegates in-process to the versioned
 [`m1-can`](https://github.com/nedlane/m1-can) library. The CLI, MCP server, and
 other consumers therefore share one bus-binding and overlap implementation.
 
+For an unsaved buffer, pass its text as `source` and its intended `.m1scr` path
+as `context_path`. The typechecker uses that filename to find the script's
+project group and backing function. Lint and format use its parent directories
+for config discovery. The server never reads source from or writes to
+`context_path`; the request's `source` remains authoritative. `context_path` is
+invalid with a file `path`, which already supplies both content and context.
+
 ### Checking CAN
 
 A `.m1dbc` carries no CAN bus of its own. A script binds it with

@@ -262,8 +262,19 @@ fn resolve_related_path_v050(
 
 /// Where the source to analyse comes from.
 pub enum Input {
-    Inline(String),
+    /// Request-provided source. `context_path` gives the unsaved buffer a
+    /// logical filename and config-discovery location; it is never read.
+    Inline {
+        source: String,
+        context_path: Option<PathBuf>,
+    },
     Path(PathBuf),
+}
+
+struct ResolvedInput<'a> {
+    source: String,
+    script_path: Option<&'a Path>,
+    inline: bool,
 }
 
 impl Input {
@@ -273,14 +284,21 @@ impl Input {
     /// size cap ([`limits::MAX_REQUEST_SOURCE_BYTES`]); a file's size is checked
     /// (cheap metadata read) *before* its bytes are read, so an oversized file
     /// is rejected without being loaded into memory.
-    fn resolve(&self) -> Result<(String, Option<&Path>), String> {
+    fn resolve(&self) -> Result<ResolvedInput<'_>, String> {
         match self {
-            Input::Inline(s) => {
-                let len = s.len() as u64;
+            Input::Inline {
+                source,
+                context_path,
+            } => {
+                let len = source.len() as u64;
                 if len > limits::MAX_REQUEST_SOURCE_BYTES {
                     return Err(over_limit_msg("inline `source`", len));
                 }
-                Ok((s.clone(), None))
+                Ok(ResolvedInput {
+                    source: source.clone(),
+                    script_path: context_path.as_deref(),
+                    inline: true,
+                })
             }
             Input::Path(p) => {
                 let meta = std::fs::metadata(p)
@@ -289,7 +307,11 @@ impl Input {
                     return Err(over_limit_msg(&format!("file {}", p.display()), meta.len()));
                 }
                 let text = m1_workspace::read_text(p).map_err(|e| e.to_string())?;
-                Ok((text, Some(p.as_path())))
+                Ok(ResolvedInput {
+                    source: text,
+                    script_path: Some(p.as_path()),
+                    inline: false,
+                })
             }
         }
     }
@@ -320,8 +342,15 @@ pub struct TypecheckOutcome {
 /// so cross-script and reference-keyword resolution runs; otherwise the script
 /// is checked standalone.
 pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<TypecheckOutcome, String> {
-    let (source, script_path) = input.resolve()?;
-    let input_source = source_dto(script_path);
+    let resolved = input.resolve()?;
+    // `context_path` is analysis context, not the source document: diagnostics
+    // for request-provided text must retain the explicit inline provenance
+    // introduced by issue #30.
+    let input_source = if resolved.inline {
+        DiagnosticSourceDto::Inline
+    } else {
+        source_dto(resolved.script_path)
+    };
 
     // Bound the whole-project work before loading anything: refuse a project
     // whose tree carries more than `MAX_PROJECT_SCRIPTS` scripts (fail fast, on
@@ -344,7 +373,14 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     let mut project_diags: Vec<DiagnosticDto> = Vec::new();
     let channels = match (project.as_mut(), project_path) {
         (Some(p), Some(pp)) => {
-            let scripts = loader::gather_project_scripts(pp);
+            let inline = if resolved.inline {
+                resolved
+                    .script_path
+                    .map(|path| (path, resolved.source.as_str()))
+            } else {
+                None
+            };
+            let scripts = loader::gather_project_scripts_with_inline(pp, inline);
             p.infer_return_types(&scripts);
             let channels = cross_script::solve(p, &scripts);
 
@@ -382,8 +418,8 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     let result = m1_typecheck::rules::check_script_with_channels(
         &enabled,
         project.as_ref(),
-        script_path,
-        &source,
+        resolved.script_path,
+        &resolved.source,
         &channels,
     );
 
@@ -540,12 +576,13 @@ fn lint_fix_outcome(result: Result<Option<String>, m1_lint::fix::FixError>) -> L
 /// Lint `input`. When it comes from a file path, the project's lint config
 /// (`.m1lint.toml` / unified `m1-tools.toml`) is discovered from that file's
 /// directory so the active rule set and thresholds match the project's CLI/CI;
-/// inline source falls back to the default rule set. When `fix` is true, the
-/// same configured runner computes a safe fixed point and returns it without
-/// writing path input. Syntax errors bypass fixing.
+/// inline source uses `context_path` for discovery when supplied, otherwise it
+/// falls back to the default rule set. When `fix` is true, the same configured
+/// runner computes a safe fixed point and returns it without writing path
+/// input. Syntax errors bypass fixing.
 pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
     let path = match input {
-        Input::Inline(_) => None,
+        Input::Inline { context_path, .. } => context_path.as_deref(),
         Input::Path(path) => Some(path.as_path()),
     };
     let config = lint_config(path)?;
@@ -559,12 +596,16 @@ pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
         });
     }
 
-    let (source, path) = input.resolve()?;
-    let input_source = source_dto(path);
+    let resolved = input.resolve()?;
+    let input_source = if resolved.inline {
+        DiagnosticSourceDto::Inline
+    } else {
+        source_dto(resolved.script_path)
+    };
 
     let registry = m1_lint::registry::Registry::from_config(&config);
     let runner = m1_lint::runner::Runner::new(registry);
-    let run = runner.run_source(&source);
+    let run = runner.run_source(&resolved.source);
 
     let mut diagnostics: Vec<LintDiagnosticDto> = run
         .syntax_errors
@@ -586,7 +627,7 @@ pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
         .count();
     let fix = fix.then(|| {
         if run.syntax_errors.is_empty() {
-            lint_fix_outcome(runner.fix_source_stable(&source))
+            lint_fix_outcome(runner.fix_source_stable(&resolved.source))
         } else {
             LintFixOutcome::Unchanged
         }
@@ -722,16 +763,20 @@ pub struct FormatOutcome {
 /// Format `input`. When it comes from a file path, the project's format config
 /// (`.m1fmt.toml` / unified `m1-tools.toml`) is discovered from that file's
 /// directory — so, e.g., a project that sets `brace_style = "kr"` is formatted
-/// K&R, not the default Allman its CI would then reject. Inline source uses the
-/// defaults. In `check_only` mode the formatted text is not returned — only
-/// whether the source is already formatted (`changed == false`).
+/// K&R, not the default Allman its CI would then reject. Inline source without
+/// a `context_path` uses the defaults. In `check_only` mode the formatted text
+/// is not returned, only whether the source is already formatted
+/// (`changed == false`).
 pub fn format(input: &Input, check_only: bool) -> Result<FormatOutcome, String> {
-    let (source, path) = input.resolve()?;
+    let resolved = input.resolve()?;
 
-    let opts = path.and_then(Path::parent).map(resolve_format_options);
+    let opts = resolved
+        .script_path
+        .and_then(Path::parent)
+        .map(resolve_format_options);
     let result = match &opts {
-        Some(o) => m1_fmt::format_str_with(&source, o),
-        None => m1_fmt::format_str(&source),
+        Some(o) => m1_fmt::format_str_with(&resolved.source, o),
+        None => m1_fmt::format_str(&resolved.source),
     }
     .map_err(|e| format!("format failed: {e}"))?;
     let warnings = result

@@ -71,9 +71,27 @@ fn doc_lookup_expands_enum_members() {
 /// A tiny well-formed M1 script body used across the analyser tests.
 const GOOD: &str = "Engine Speed Warning is True\n";
 
+fn inline(source: impl Into<String>) -> Input {
+    Input::Inline {
+        source: source.into(),
+        context_path: None,
+    }
+}
+
+fn inline_at(source: impl Into<String>, context_path: impl Into<std::path::PathBuf>) -> Input {
+    Input::Inline {
+        source: source.into(),
+        context_path: Some(context_path.into()),
+    }
+}
+
+fn has_code(diagnostics: &[analyze::DiagnosticDto], code: &str) -> bool {
+    diagnostics.iter().any(|d| d.code == code)
+}
+
 #[test]
 fn typecheck_reports_no_error_count_for_reasonable_source() {
-    let out = analyze::typecheck(&Input::Inline(GOOD.to_string()), None).expect("typecheck runs");
+    let out = analyze::typecheck(&inline(GOOD), None).expect("typecheck runs");
     // We don't assert zero diagnostics (standalone snippets can warn), but the
     // structured counts must be consistent with the diagnostics list.
     let errors = out
@@ -88,7 +106,7 @@ fn typecheck_reports_no_error_count_for_reasonable_source() {
 #[test]
 fn typecheck_flags_a_syntax_error() {
     // Unterminated construct → the parser should emit a syntax diagnostic.
-    let out = analyze::typecheck(&Input::Inline("if (".to_string()), None).expect("runs");
+    let out = analyze::typecheck(&inline("if ("), None).expect("runs");
     let hit = out
         .diagnostics
         .iter()
@@ -372,8 +390,123 @@ fn typecheck_identifies_project_diagnostic_path_and_subject() {
 }
 
 #[test]
+fn inline_context_path_anchors_project_group_and_backing_function() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts_dir = dir.path().join("Scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Context" TargetHardware="ecu150">
+  <ComponentStream>
+   <List>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
+    <Component Classname="BuiltIn.Parameter" Name="Root.Ctrl.Gain">
+     <Props Type="u32" Security="Calibration"/>
+    </Component>
+    <Component Classname="BuiltIn.FuncUserParam"
+      Filename="Ctrl.Scale.m1scr" Name="Root.Ctrl.Scale">
+     <Signature Name="" ReturnType="f32">
+      <Params><Param Name="Input" Type="f32" Attrs="0"/></Params>
+     </Signature>
+    </Component>
+   </List>
+  </ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+
+    let source = "local mixed = Calculate.Max(1.0, Gain);\nlocal inputCopy = In.Input;\n";
+    let standalone = analyze::typecheck(&inline(source), None).expect("standalone check runs");
+    let without_context = analyze::typecheck(&inline(source), Some(&project))
+        .expect("project-only inline check runs");
+
+    let context_path = scripts_dir.join("Ctrl.Scale.m1scr");
+    assert!(
+        !context_path.exists(),
+        "the logical script must stay unsaved"
+    );
+    let with_context = analyze::typecheck(&inline_at(source, context_path.clone()), Some(&project))
+        .expect("contextual inline check runs");
+
+    assert!(
+        !has_code(&standalone.diagnostics, "T065") && !has_code(&standalone.diagnostics, "T099"),
+        "standalone source has neither project nor path context: {:?}",
+        standalone.diagnostics
+    );
+    assert!(
+        !has_code(&without_context.diagnostics, "T065"),
+        "without a group, relative Gain stays opaque: {:?}",
+        without_context.diagnostics
+    );
+    assert!(
+        !has_code(&without_context.diagnostics, "T099"),
+        "without a backing function, the return contract is unknown: {:?}",
+        without_context.diagnostics
+    );
+    assert!(
+        has_code(&with_context.diagnostics, "T065"),
+        "context must resolve Ctrl.Gain as u32: {:?}",
+        with_context.diagnostics
+    );
+    assert!(
+        has_code(&with_context.diagnostics, "T099"),
+        "context must resolve Ctrl.Scale's declared return: {:?}",
+        with_context.diagnostics
+    );
+    let contextual = with_context
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T065" || diagnostic.code == "T099")
+        .expect("contextual analysis should produce a source diagnostic");
+    assert_eq!(
+        contextual.source,
+        DiagnosticSourceDto::Inline,
+        "context_path is analysis context, not file-backed provenance"
+    );
+    assert_eq!(
+        serde_json::to_value(&contextual.source).unwrap(),
+        serde_json::json!({ "kind": "inline" })
+    );
+    assert!(
+        !context_path.exists(),
+        "typecheck must not create or read the logical script"
+    );
+}
+
+#[test]
+fn inline_source_replaces_a_stale_project_script_without_overwriting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts_dir = dir.path().join("Scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let project = dir.path().join("Project.m1prj");
+    let context_path = scripts_dir.join("Ctrl.Scale.m1scr");
+    let stale_source = "Out.Result = 1;\n";
+    let inline_source = "Out.Result = 2;\n";
+    std::fs::write(&context_path, stale_source).unwrap();
+
+    let scripts =
+        loader::gather_project_scripts_with_inline(&project, Some((&context_path, inline_source)));
+    let contextual = scripts
+        .iter()
+        .find(|script| script.name == "Ctrl.Scale.m1scr")
+        .expect("the contextual script is included in the project pass");
+
+    assert_eq!(contextual.cst.source(), inline_source);
+    assert_eq!(
+        std::fs::read_to_string(&context_path).unwrap(),
+        stale_source,
+        "context_path must not be overwritten"
+    );
+}
+
+#[test]
 fn lint_returns_consistent_counts() {
-    let out = analyze::lint(&Input::Inline(GOOD.to_string()), false).expect("lint runs");
+    let out = analyze::lint(&inline(GOOD), false).expect("lint runs");
     let warns = out
         .diagnostics
         .iter()
@@ -386,8 +519,7 @@ fn lint_returns_consistent_counts() {
 
 #[test]
 fn lint_finding_reports_name_and_fixability_and_returns_safe_fix() {
-    let out =
-        analyze::lint(&Input::Inline("Result = A == B;\n".to_string()), true).expect("lint runs");
+    let out = analyze::lint(&inline("Result = A == B;\n"), true).expect("lint runs");
     let finding = out
         .diagnostics
         .iter()
@@ -412,7 +544,7 @@ fn lint_finding_reports_name_and_fixability_and_returns_safe_fix() {
 #[test]
 fn unfixable_lint_finding_returns_unchanged() {
     let source = format!("// {}\n", "x".repeat(90));
-    let out = analyze::lint(&Input::Inline(source), true).expect("lint runs");
+    let out = analyze::lint(&inline(source), true).expect("lint runs");
     let finding = out
         .diagnostics
         .iter()
@@ -427,7 +559,7 @@ fn unfixable_lint_finding_returns_unchanged() {
 fn syntax_errors_bypass_lint_fixes() {
     // The upstream fixer can repair a missing semicolon. MCP fix mode must not
     // invoke it when the original parse has any syntax error.
-    let out = analyze::lint(&Input::Inline("Result = 1\n".to_string()), true).expect("lint runs");
+    let out = analyze::lint(&inline("Result = 1\n"), true).expect("lint runs");
     let syntax = out
         .diagnostics
         .iter()
@@ -540,13 +672,13 @@ fn lint_fix_uses_the_same_project_config_as_diagnostics() {
 #[test]
 fn lint_fix_output_is_a_stable_fixed_point() {
     let original = "Result = A == B && C;\n";
-    let first = analyze::lint(&Input::Inline(original.to_string()), true).expect("lint runs");
+    let first = analyze::lint(&inline(original), true).expect("lint runs");
     let Some(LintFixOutcome::Fixed { source }) = first.fix else {
         panic!("expected fixed source, got {:?}", first.fix);
     };
     assert_eq!(source, "Result = A eq B and C;\n");
 
-    let second = analyze::lint(&Input::Inline(source), true).expect("lint runs again");
+    let second = analyze::lint(&inline(source), true).expect("lint runs again");
     assert_eq!(second.fix, Some(LintFixOutcome::Unchanged));
 }
 
@@ -626,13 +758,13 @@ fn lint_tool_schemas_expose_fix_and_rule_metadata() {
 
 #[test]
 fn format_check_only_omits_output() {
-    let out = analyze::format(&Input::Inline(GOOD.to_string()), true).expect("format runs");
+    let out = analyze::format(&inline(GOOD), true).expect("format runs");
     assert!(out.formatted.is_none(), "check_only must not return text");
 }
 
 #[test]
 fn format_returns_text() {
-    let out = analyze::format(&Input::Inline(GOOD.to_string()), false).expect("format runs");
+    let out = analyze::format(&inline(GOOD), false).expect("format runs");
     assert!(
         out.formatted.is_some(),
         "non-check mode returns formatted text"
@@ -646,7 +778,7 @@ fn typecheck_rejects_oversized_inline_source() {
     // One byte over the inline-source cap must be refused with a clear message
     // naming the limit — not parsed.
     let big = "A".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize + 1);
-    let err = analyze::typecheck(&Input::Inline(big), None)
+    let err = analyze::typecheck(&inline_at(big, "Scripts/Unsaved.m1scr"), None)
         .expect_err("oversize inline source must be rejected");
     assert!(
         err.contains("exceeds") && err.contains("per-request limit"),
@@ -678,7 +810,7 @@ fn source_at_the_limit_is_accepted() {
     // rejected. (Newlines keep the parser cheap.)
     let at = "\n".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize);
     assert!(
-        analyze::lint(&Input::Inline(at), false).is_ok(),
+        analyze::lint(&inline(at), false).is_ok(),
         "source exactly at the limit must be accepted"
     );
 }
@@ -720,7 +852,7 @@ fn typecheck_rejects_over_budget_project_before_loading() {
     for i in 0..(limits::MAX_PROJECT_SCRIPTS + 1) {
         std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
     }
-    let err = analyze::typecheck(&Input::Inline(GOOD.to_string()), Some(&proj))
+    let err = analyze::typecheck(&inline(GOOD), Some(&proj))
         .expect_err("over-budget project must be rejected");
     assert!(
         err.contains("exceeds") && err.contains("script"),
@@ -761,9 +893,52 @@ fn format_reads_brace_style_from_project_config() {
     );
 
     // The identical source formatted inline (no config) keeps Allman.
-    let inline = analyze::format(&Input::Inline(allman.to_string()), false).unwrap();
+    let inline = analyze::format(&inline(allman), false).unwrap();
     assert!(
         !inline.formatted.unwrap().contains(") {"),
         "inline format must use the default Allman, not the project's kr"
+    );
+
+    // A logical path discovers the same config while the source remains the
+    // request buffer. The path itself need not exist and must not be created.
+    let context_path = dir.path().join("unsaved.m1scr");
+    let contextual = analyze::format(&inline_at(allman, context_path.clone()), false).unwrap();
+    assert!(
+        contextual.formatted.unwrap().contains(") {"),
+        "context_path must discover the project's K&R format config"
+    );
+    assert!(!context_path.exists(), "format must not write context_path");
+}
+
+#[test]
+fn lint_discovers_project_config_from_inline_context_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".m1lint.toml"), "ignore = [\"L004\"]\n").unwrap();
+    let source = "x = a == b;\n";
+
+    let without_context = analyze::lint(&inline(source), false).expect("default lint runs");
+    assert!(
+        without_context
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "L004"),
+        "default lint should flag ==: {:?}",
+        without_context.diagnostics
+    );
+
+    let context_path = dir.path().join("unsaved.m1scr");
+    let with_context = analyze::lint(&inline_at(source, context_path.clone()), false)
+        .expect("contextual lint runs");
+    assert!(
+        !with_context
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "L004"),
+        "context_path must discover .m1lint.toml: {:?}",
+        with_context.diagnostics
+    );
+    assert!(
+        !context_path.exists(),
+        "lint must not read or create context_path"
     );
 }

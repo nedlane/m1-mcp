@@ -69,17 +69,40 @@ pub fn load_project_full(project_path: &Path) -> Result<Project, String> {
 /// key the project uses to map a script to its group/function), matching the
 /// CLI's whole-project pass set.
 pub fn gather_project_scripts(project_path: &Path) -> Vec<ParsedScript> {
+    gather_project_scripts_with_inline(project_path, None)
+}
+
+/// Parse every project script while replacing the script identified by
+/// `inline` with request-provided source. Matching uses the filename because
+/// that is how `Project.m1prj` maps scripts to functions. If no on-disk file
+/// has that name, the inline script is still added to the project-wide set.
+/// The logical path is never read.
+pub fn gather_project_scripts_with_inline(
+    project_path: &Path,
+    inline: Option<(&Path, &str)>,
+) -> Vec<ParsedScript> {
     let Some(root) = project_path.parent() else {
         return Vec::new();
     };
-    let pairs: Vec<(String, String)> = m1_workspace::find_scripts(root)
+    let inline_name = inline.and_then(|(path, _)| path.file_name()?.to_str());
+    let mut replaced_inline = false;
+    let mut pairs: Vec<(String, String)> = m1_workspace::find_scripts(root)
         .iter()
         .filter_map(|f| {
-            Some((
-                f.file_name()?.to_str()?.to_string(),
-                m1_workspace::read_text(f).ok()?,
-            ))
+            let name = f.file_name()?.to_str()?.to_string();
+            let source = match inline {
+                Some((_, source)) if Some(name.as_str()) == inline_name => {
+                    replaced_inline = true;
+                    source.to_string()
+                }
+                _ => m1_workspace::read_text(f).ok()?,
+            };
+            Some((name, source))
         })
         .collect();
+
+    if !replaced_inline && let (Some(name), Some((_, source))) = (inline_name, inline) {
+        pairs.push((name.to_string(), source.to_string()));
+    }
     parsed::parse_all(&pairs)
 }
