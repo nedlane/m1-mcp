@@ -12,21 +12,68 @@ use std::path::{Path, PathBuf};
 
 use m1_core::{Diagnostic, Severity};
 use m1_typecheck::cross_script::{self, ChannelTaints};
-use m1_typecheck::diagnostics::TypeDiagnostic;
+use m1_typecheck::diagnostics::{RelatedPlace, TypeDiagnostic};
 use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::{limits, loader};
 
-/// A single diagnostic in agent-friendly form (1-based line/column).
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+/// Whether a finding belongs to source text or the project model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticScope {
+    Source,
+    Project,
+}
+
+/// The document a diagnostic belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiagnosticSourceDto {
+    /// Source supplied directly in the MCP request.
+    Inline,
+    /// A file on disk. `path` is the same logical path the analyser used.
+    Path { path: String },
+}
+
+/// The declaration side of a two-location type diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct RelatedLocationDto {
+    /// Project file containing the declaration.
+    pub path: String,
+    /// 1-based line in `path`.
+    pub line: u32,
+    pub message: String,
+}
+
+/// A single diagnostic in agent-friendly form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DiagnosticDto {
     /// Rule code (`T030`, `L012`, or `syntax`).
     pub code: String,
     /// `error` | `warning` | `info` | `hint`.
     pub severity: String,
+    /// Whether this finding is anchored in script source or in the project.
+    pub scope: DiagnosticScope,
+    /// Inline input, a script path, or the project file for this finding.
+    pub source: DiagnosticSourceDto,
+    /// 1-based start line. Retained for compatibility with the original DTO.
     pub line: u32,
+    /// 1-based start column. Retained for compatibility with the original DTO.
     pub column: u32,
+    /// 1-based end line of the half-open source range.
+    pub end_line: u32,
+    /// 1-based end column of the half-open source range.
+    pub end_column: u32,
+    /// 0-based byte offset where the half-open range starts.
+    pub byte_start: usize,
+    /// 0-based byte offset where the half-open range ends.
+    pub byte_end: usize,
+    /// Project symbol a project-level finding concerns, when supplied upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Declaration or signature locations related to this finding.
+    pub related: Vec<RelatedLocationDto>,
     pub message: String,
 }
 
@@ -39,14 +86,65 @@ fn severity_str(s: Severity) -> &'static str {
     }
 }
 
-fn to_dto(code: &str, d: &Diagnostic) -> DiagnosticDto {
+fn source_dto(path: Option<&Path>) -> DiagnosticSourceDto {
+    match path {
+        Some(path) => DiagnosticSourceDto::Path {
+            path: path.display().to_string(),
+        },
+        None => DiagnosticSourceDto::Inline,
+    }
+}
+
+fn to_dto(
+    code: &str,
+    d: &Diagnostic,
+    scope: DiagnosticScope,
+    source: DiagnosticSourceDto,
+) -> DiagnosticDto {
     DiagnosticDto {
         code: code.to_string(),
         severity: severity_str(d.severity).to_string(),
+        scope,
+        source,
         line: d.range.start.line + 1,
         column: d.range.start.column + 1,
+        end_line: d.range.end.line + 1,
+        end_column: d.range.end.column + 1,
+        byte_start: d.byte_range.start,
+        byte_end: d.byte_range.end,
+        subject: None,
+        related: Vec::new(),
         message: d.message.clone(),
     }
+}
+
+fn type_to_dto(
+    diagnostic: &TypeDiagnostic,
+    scope: DiagnosticScope,
+    source: DiagnosticSourceDto,
+    project_path: Option<&Path>,
+) -> Result<DiagnosticDto, String> {
+    let mut dto = to_dto(diagnostic.code.as_str(), &diagnostic.inner, scope, source);
+    dto.subject.clone_from(&diagnostic.subject);
+    dto.related = diagnostic
+        .related
+        .iter()
+        .map(|related| {
+            let RelatedPlace::Project { line } = related.place;
+            let path = project_path.ok_or_else(|| {
+                format!(
+                    "{} diagnostic carries a project related location without a project path",
+                    diagnostic.code.as_str()
+                )
+            })?;
+            Ok(RelatedLocationDto {
+                path: path.display().to_string(),
+                line: line + 1,
+                message: related.message.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(dto)
 }
 
 /// Where the source to analyse comes from.
@@ -110,6 +208,7 @@ pub struct TypecheckOutcome {
 /// is checked standalone.
 pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<TypecheckOutcome, String> {
     let (source, script_path) = input.resolve()?;
+    let input_source = source_dto(script_path);
 
     // Bound the whole-project work before loading anything: refuse a project
     // whose tree carries more than `MAX_PROJECT_SCRIPTS` scripts (fail fast, on
@@ -150,8 +249,15 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
             pd.extend(m1_typecheck::dbc_init::check(p, &scripts));
             project_diags = pd
                 .iter()
-                .map(|d| to_dto(d.code.as_str(), &d.inner))
-                .collect();
+                .map(|diagnostic| {
+                    type_to_dto(
+                        diagnostic,
+                        DiagnosticScope::Project,
+                        source_dto(Some(pp)),
+                        Some(pp),
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()?;
 
             channels
         }
@@ -170,13 +276,28 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     let mut diagnostics: Vec<DiagnosticDto> = result
         .syntax_errors
         .iter()
-        .map(|d| to_dto("syntax", d))
+        .map(|diagnostic| {
+            to_dto(
+                "syntax",
+                diagnostic,
+                DiagnosticScope::Source,
+                input_source.clone(),
+            )
+        })
         .collect();
     diagnostics.extend(
         result
             .diagnostics
             .iter()
-            .map(|d| to_dto(d.code.as_str(), &d.inner)),
+            .map(|diagnostic| {
+                type_to_dto(
+                    diagnostic,
+                    DiagnosticScope::Source,
+                    input_source.clone(),
+                    project_path,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?,
     );
     diagnostics.extend(project_diags);
 
@@ -208,6 +329,7 @@ pub struct LintOutcome {
 /// inline source falls back to the default rule set.
 pub fn lint(input: &Input) -> Result<LintOutcome, String> {
     let (source, path) = input.resolve()?;
+    let input_source = source_dto(path);
 
     let registry = match path
         .and_then(Path::parent)
@@ -222,13 +344,23 @@ pub fn lint(input: &Input) -> Result<LintOutcome, String> {
     let mut diagnostics: Vec<DiagnosticDto> = run
         .syntax_errors
         .iter()
-        .map(|d| to_dto("syntax", d))
+        .map(|diagnostic| {
+            to_dto(
+                "syntax",
+                diagnostic,
+                DiagnosticScope::Source,
+                input_source.clone(),
+            )
+        })
         .collect();
-    diagnostics.extend(
-        run.diagnostics
-            .iter()
-            .map(|d| to_dto(&d.code.to_string(), &d.inner)),
-    );
+    diagnostics.extend(run.diagnostics.iter().map(|diagnostic| {
+        to_dto(
+            &diagnostic.code.to_string(),
+            &diagnostic.inner,
+            DiagnosticScope::Source,
+            input_source.clone(),
+        )
+    }));
 
     let error_count = diagnostics.iter().filter(|d| d.severity == "error").count();
     let warning_count = diagnostics
