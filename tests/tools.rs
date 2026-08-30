@@ -2,7 +2,7 @@
 //! in-process analyser functions directly (the same functions the MCP tools
 //! call), asserting on the serializable DTOs.
 
-use m1_mcp::analyze::{self, Input};
+use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input};
 use m1_mcp::doc::{self, DocKind};
 use m1_mcp::{limits, loader};
 
@@ -89,12 +89,20 @@ fn typecheck_reports_no_error_count_for_reasonable_source() {
 fn typecheck_flags_a_syntax_error() {
     // Unterminated construct → the parser should emit a syntax diagnostic.
     let out = analyze::typecheck(&Input::Inline("if (".to_string()), None).expect("runs");
-    assert!(
-        out.diagnostics
-            .iter()
-            .any(|d| d.code == "syntax" || d.severity == "error"),
-        "broken source should produce an error diagnostic: {:?}",
-        out.diagnostics
+    let hit = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "syntax" || d.severity == "error")
+        .unwrap_or_else(|| panic!("broken source should produce an error: {out:?}"));
+    assert_eq!(hit.scope, DiagnosticScope::Source);
+    assert_eq!(hit.source, DiagnosticSourceDto::Inline);
+    assert!(hit.line >= 1 && hit.column >= 1);
+    assert!(hit.end_line >= hit.line);
+    assert!(hit.byte_end >= hit.byte_start);
+    assert_eq!(
+        serde_json::to_value(&hit.source).unwrap(),
+        serde_json::json!({ "kind": "inline" }),
+        "inline diagnostics need an explicit serialized source marker"
     );
 }
 
@@ -146,15 +154,16 @@ fn typecheck_catches_cfg_typed_intrinsic_overload_mismatch() {
     let script = scripts_dir.join("CAN.Inverters Transcieve 200hz.m1scr");
     std::fs::write(
         &script,
-        "local fRearPolePairs = Calculate.Max(1.0, DTI FSIC Rear.Pole Pairs);\n",
+        concat!(
+            "local fRearPolePairs = Calculate.Max(1.0, DTI FSIC Rear.Pole Pairs);\n",
+            "DTI FSIC Rear.Pole Pairs = 1.5;\n",
+        ),
     )
     .unwrap();
 
-    let out = analyze::typecheck(
-        &Input::Path(script),
-        Some(&project_dir.join("Project.m1prj")),
-    )
-    .expect("typecheck runs");
+    let project = project_dir.join("Project.m1prj");
+    let out =
+        analyze::typecheck(&Input::Path(script.clone()), Some(&project)).expect("typecheck runs");
     let hit = out
         .diagnostics
         .iter()
@@ -166,6 +175,200 @@ fn typecheck_catches_cfg_typed_intrinsic_overload_mismatch() {
         "unexpected T065 message: {}",
         hit.message
     );
+    assert_eq!(hit.scope, DiagnosticScope::Source);
+    assert_eq!(
+        hit.source,
+        DiagnosticSourceDto::Path {
+            path: script.display().to_string()
+        }
+    );
+    assert!(hit.end_line >= hit.line);
+    assert!(hit.byte_end > hit.byte_start);
+
+    let mismatch = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "T030")
+        .expect("float assignment should produce a two-location T030");
+    let related = mismatch
+        .related
+        .first()
+        .expect("T030 should retain its declaration location");
+    assert_eq!(related.path, project.display().to_string());
+    assert!(related.line >= 1);
+    assert!(related.message.contains("declared"));
+}
+
+#[test]
+fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Related" TargetHardware="ecu120">
+  <DataTypes><Type Name="Switch State" Storage="enum" Default="Off"><Enum Name="Off" ContainerOrder="0"/><Enum Name="On" ContainerOrder="1"/></Type></DataTypes>
+  <ComponentStream>
+   <List>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
+    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.m1scr" Name="Root.Ctrl.Helper">
+     <Signature Name="" ReturnType="f32">
+      <Params><Param Name="BusA" Type="f32" Attrs="0"/></Params>
+     </Signature>
+    </Component>
+    <Component Classname="BuiltIn.FuncUser" Filename="Caller.m1scr" Name="Root.Ctrl.Caller"/>
+    <Component Classname="BuiltIn.Parameter" Name="Root.Ctrl.SwitchMode.Value"><Props/></Component>
+   </List>
+  </ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("parameters.m1cfg"),
+        r#"<?xml version="1.0"?>
+<Configuration><Group Name=""><Parameter Name="Root.Ctrl.SwitchMode.Value"><Cell Type="enum"><![CDATA[On]]></Cell></Parameter></Group></Configuration>
+"#,
+    )
+    .unwrap();
+
+    let dbc_xml = |root: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+<DBC>
+ <ComponentStream>
+  <List>
+
+
+
+   <Component Classname="BuiltIn.CAN.DBC" Name="{root}"/>
+   <Component Classname="BuiltIn.CAN.Message" Name="{root}.Frame"><Props CANId="100" DLC="8"/></Component>
+   <Component Classname="BuiltIn.CAN.Signal" Name="{root}.Frame.Count"><Props Type="u32" StartBit="0" Length="10"/></Component>
+  </List>
+ </ComponentStream>
+</DBC>
+"#
+        )
+    };
+    let dbc_a = dir.path().join("BusA.m1dbc");
+    let dbc_b = dir.path().join("BusB.m1dbc");
+    std::fs::write(&dbc_a, dbc_xml("BusA")).unwrap();
+    std::fs::write(&dbc_b, dbc_xml("BusB")).unwrap();
+
+    let caller = dir.path().join("Caller.m1scr");
+    std::fs::write(
+        &caller,
+        "BusB.Frame.Count = 1.5;\nSwitchMode.Value = 3;\nlocal result = Helper();\n",
+    )
+    .unwrap();
+    let helper = dir.path().join("Helper.m1scr");
+    std::fs::write(&helper, "Out = 1.0;\n").unwrap();
+
+    let out = analyze::typecheck(&Input::Path(caller), Some(&project)).expect("typecheck runs");
+    let assignment = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "T030"
+                && diagnostic.message.contains("Unsigned")
+                && diagnostic
+                    .related
+                    .iter()
+                    .any(|related| related.message.contains("BusB.Frame.Count"))
+        })
+        .unwrap_or_else(|| panic!("DBC assignment should produce T030: {out:?}"));
+    assert_eq!(assignment.related.len(), 1);
+    assert_eq!(assignment.related[0].path, dbc_b.display().to_string());
+
+    let enum_assignment = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T030" && diagnostic.message.contains("Switch State"))
+        .unwrap_or_else(|| panic!("enum assignment should produce T030: {out:?}"));
+    assert_eq!(enum_assignment.related.len(), 1);
+    assert_eq!(
+        enum_assignment.related[0].path,
+        project.display().to_string()
+    );
+
+    let arity = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T085")
+        .unwrap_or_else(|| panic!("bad Helper call should produce T085: {out:?}"));
+    assert_eq!(arity.related.len(), 1);
+    assert_eq!(arity.related[0].path, project.display().to_string());
+    assert_ne!(
+        arity.related[0].path,
+        dir.path().join("Helper.m1scr").display().to_string()
+    );
+
+    // T098 quotes both the unused argument (`BusA`) and the defining function.
+    // The DBC root deliberately shares the function's declaration line, so
+    // provenance resolution must use the final defining-symbol token.
+    let helper_out =
+        analyze::typecheck(&Input::Path(helper), Some(&project)).expect("typecheck runs");
+    let unused = helper_out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T098")
+        .unwrap_or_else(|| panic!("unused BusA argument should produce T098: {helper_out:?}"));
+    assert_eq!(unused.related.len(), 1);
+    assert_eq!(unused.related[0].path, project.display().to_string());
+}
+
+#[test]
+fn typecheck_identifies_project_diagnostic_path_and_subject() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Schedule" TargetHardware="ecu120">
+  <ComponentStream>
+   <List>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+    <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
+    <Component Classname="BuiltIn.FuncUser" Filename="Ctrl.Alpha.m1scr" Name="Root.Ctrl.Alpha">
+     <Props SelectedTrigger="Parent.Events.On 100Hz"/>
+    </Component>
+    <Component Classname="BuiltIn.FuncUser" Filename="Ctrl.Beta.m1scr" Name="Root.Ctrl.Beta">
+     <Props SelectedTrigger="Parent.Events.On 100Hz"/>
+    </Component>
+    <Component Classname="BuiltIn.Channel" Name="Root.Ctrl.A Out"><Props Type="f32"/></Component>
+    <Component Classname="BuiltIn.Channel" Name="Root.Ctrl.B Out"><Props Type="f32"/></Component>
+   </List>
+  </ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    let alpha = dir.path().join("Ctrl.Alpha.m1scr");
+    let beta = dir.path().join("Ctrl.Beta.m1scr");
+    std::fs::write(&alpha, "A Out = B Out + 1.0;\n").unwrap();
+    std::fs::write(&beta, "B Out = A Out + 1.0;\n").unwrap();
+
+    let out = analyze::typecheck(&Input::Path(alpha), Some(&project)).expect("typecheck runs");
+    let cycle = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "T088")
+        .unwrap_or_else(|| panic!("same-rate cycle should produce T088: {out:?}"));
+    assert_eq!(cycle.scope, DiagnosticScope::Project);
+    assert_eq!(
+        cycle.source,
+        DiagnosticSourceDto::Path {
+            path: project.display().to_string()
+        }
+    );
+    assert_eq!(cycle.subject.as_deref(), Some("Root.Ctrl.Alpha"));
+    assert_eq!((cycle.line, cycle.column), (1, 1));
+    assert_eq!((cycle.byte_start, cycle.byte_end), (0, 0));
 }
 
 #[test]

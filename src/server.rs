@@ -164,7 +164,7 @@ impl M1Server {
 
     /// Type-check M1 script, returning diagnostics.
     #[tool(
-        description = "Type-check M1 script (inline `source` or a file `path`), returning diagnostics with code, severity, and line/column. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks."
+        description = "Type-check M1 script (inline `source` or a file `path`), returning source/project-scoped diagnostics with paths, exact position/byte ranges, project subjects, and related declaration locations. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks."
     )]
     async fn m1_typecheck(
         &self,
@@ -179,7 +179,7 @@ impl M1Server {
 
     /// Lint M1 script with the default rule set, returning diagnostics.
     #[tool(
-        description = "Lint M1 script (inline `source` or a file `path`) with the default M1 rule set, returning L0xx diagnostics with code, severity, and line/column."
+        description = "Lint M1 script (inline `source` or a file `path`) with the default M1 rule set, returning source-scoped L0xx diagnostics with paths and exact position/byte ranges."
     )]
     async fn m1_lint(
         &self,
