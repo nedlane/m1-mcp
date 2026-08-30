@@ -31,6 +31,7 @@ pub struct SymbolsOutcome {
     pub symbols: Vec<SymbolDto>,
     /// Total symbols in the project (before any `filter` was applied).
     pub total: usize,
+    pub load_report: crate::loader::ProjectLoadReport,
 }
 
 fn kind_str(k: SymbolKind) -> &'static str {
@@ -75,7 +76,8 @@ pub fn list(
 
     // Load the project fully (parameters.m1cfg + .m1dbc), so parameter types/
     // units and CAN signals are populated rather than Unknown/absent.
-    let project = crate::loader::load_project_full(project_path)?;
+    let loaded = crate::loader::load_project_full(project_path)?;
+    let project = loaded.project;
     let table = project.symbols();
     let total = table.len();
 
@@ -100,5 +102,9 @@ pub fn list(
         symbols.truncate(limit);
     }
 
-    Ok(SymbolsOutcome { symbols, total })
+    Ok(SymbolsOutcome {
+        symbols,
+        total,
+        load_report: loaded.report,
+    })
 }

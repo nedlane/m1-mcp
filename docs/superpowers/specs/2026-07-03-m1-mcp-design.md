@@ -55,7 +55,9 @@ agent (Claude Code / Cursor)  ──stdio/JSON-RPC──▶  m1-mcp
 | `m1_symbols` | `m1_typecheck::Project` | Load a project and list its workspace symbols (path, kind, type, unit, security), optional name substring filter. |
 
 All tool results are returned as **structured JSON** (`rmcp::Json<T>`) so agents
-get machine-readable diagnostics, not prose to re-parse.
+get machine-readable diagnostics, not prose to re-parse. Project-backed tools
+also return a shared load report naming the configuration, loaded DBCs, readable
+script count, and every skipped auxiliary input.
 
 ### Data flow
 
@@ -64,10 +66,20 @@ Each tool call: deserialize typed params → build the relevant M1 lib input
 use inline `source`) → call the lib → map the lib's result type to a small
 serializable DTO → return `Json`. Stateless; no caching in v1.
 
+MCP-native project calls build an augmented model and parse-once script set
+through `loader::load_project_full`. Its report distinguishes missing
+configuration, no DBC files, complete DBC loading, and a partial load with
+per-path errors. The MCP CAN wrapper preflights that loader before delegating to
+`m1-can`, flattens the shared CAN outcome so its established fields stay stable,
+then adds the preflight report.
+
 ### Error handling
 
 - Bad input (neither `source` nor `path`, unreadable file, unparseable
   project) → a structured tool error, never a panic.
+- An unreadable script or malformed auxiliary DBC produces a partial result
+  with its path and error in `load_report`; it is never presented as a complete
+  clean result.
 - Syntax errors in M1 source are reported as diagnostics, not failures — the
   same contract the CLIs use.
 - Doc lookups that miss return an empty result set, not an error.

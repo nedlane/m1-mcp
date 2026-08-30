@@ -10,8 +10,74 @@ use std::path::Path;
 
 use m1_typecheck::parsed::{self, ParsedScript};
 use m1_typecheck::project::Project;
+use schemars::JsonSchema;
+use serde::Serialize;
 
 use crate::limits;
+
+/// Whether project parameter configuration was found and loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ConfigurationLoad {
+    /// No `.m1cfg` file was discovered from the project directory or its
+    /// ancestors, so parameter types and calibrated values may be unavailable.
+    Missing,
+    /// The discovered configuration was loaded into the project model.
+    Loaded { path: String },
+}
+
+/// Aggregate state of the project's discovered `.m1dbc` inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DbcLoadState {
+    /// No `.m1dbc` files were found under the project directory.
+    NoneFound,
+    /// Every discovered `.m1dbc` was loaded.
+    Complete,
+    /// At least one discovered `.m1dbc` could not be loaded. The successfully
+    /// loaded files remain available in the partial model.
+    Partial,
+}
+
+/// One auxiliary project input that could not be loaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SkippedInput {
+    pub path: String,
+    pub error: String,
+}
+
+/// What contributed to a loaded project model.
+///
+/// A report accompanies every successful project load so an empty diagnostic,
+/// symbol, or CAN result cannot be mistaken for proof that inputs which failed
+/// to load were clean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ProjectLoadReport {
+    /// The main project file. A failure to load this file is returned as a tool
+    /// error instead of producing a report for a nonexistent model.
+    pub project: String,
+    pub configuration: ConfigurationLoad,
+    pub dbc_state: DbcLoadState,
+    /// Successfully loaded `.m1dbc` files, in deterministic discovery order.
+    pub loaded_dbcs: Vec<String>,
+    /// Number of scripts successfully read and parsed into the shared script
+    /// set. Syntax diagnostics do not make a readable script "skipped".
+    pub script_count: usize,
+    pub skipped_dbcs: Vec<SkippedInput>,
+    pub skipped_scripts: Vec<SkippedInput>,
+}
+
+/// A fully augmented project and its parse-once script set, paired with the
+/// report that describes every loaded or skipped auxiliary input.
+pub struct LoadedProject {
+    pub project: Project,
+    pub scripts: Vec<ParsedScript>,
+    pub report: ProjectLoadReport,
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
 
 /// Bound the whole-project work a single request can trigger: error if the
 /// project rooted at `project_path` contains more than
@@ -36,73 +102,109 @@ pub fn check_project_script_budget(project_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Load `project_path` (`Project.m1prj`) and layer in the discovered
-/// `parameters.m1cfg` (parameter types/units) and every `.m1dbc` under the
-/// project directory (CAN signal types/ranges). A malformed `.m1dbc` is skipped
-/// (kept non-fatal, like the CLI) rather than blanking the whole model.
-pub fn load_project_full(project_path: &Path) -> Result<Project, String> {
+/// Load `project_path` (`Project.m1prj`), layer in the discovered
+/// `parameters.m1cfg` and every readable `.m1dbc`, then read and parse every
+/// project script once. Malformed auxiliary DBCs and unreadable scripts are
+/// retained in the report instead of silently disappearing; a malformed main
+/// project (or discovered configuration) remains an error.
+pub fn load_project_full(project_path: &Path) -> Result<LoadedProject, String> {
+    load_project_full_with_inline(project_path, None)
+}
+
+/// Load one project snapshot while replacing the script named by `inline`
+/// with request-provided source. The logical inline path is never read.
+pub fn load_project_full_with_inline(
+    project_path: &Path,
+    inline: Option<(&Path, &str)>,
+) -> Result<LoadedProject, String> {
     let mut p = Project::load(project_path).map_err(|e| format!("failed to load project: {e}"))?;
 
+    let mut report = ProjectLoadReport {
+        project: path_string(project_path),
+        configuration: ConfigurationLoad::Missing,
+        dbc_state: DbcLoadState::NoneFound,
+        loaded_dbcs: Vec::new(),
+        script_count: 0,
+        skipped_dbcs: Vec::new(),
+        skipped_scripts: Vec::new(),
+    };
+
     let Some(dir) = project_path.parent() else {
-        return Ok(p);
+        return Ok(LoadedProject {
+            project: p,
+            scripts: Vec::new(),
+            report,
+        });
     };
 
     if let Some(cfg) = m1_workspace::find_config_file(dir) {
         p = p
             .with_config(&cfg)
             .map_err(|e| format!("config {}: {e}", cfg.display()))?;
+        report.configuration = ConfigurationLoad::Loaded {
+            path: path_string(&cfg),
+        };
     }
 
-    for dbc in m1_workspace::find_dbc_files(dir) {
+    let dbc_files = m1_workspace::find_dbc_files(dir);
+    report.dbc_state = if dbc_files.is_empty() {
+        DbcLoadState::NoneFound
+    } else {
+        DbcLoadState::Complete
+    };
+    for dbc in dbc_files {
         let rel = dbc
             .strip_prefix(dir)
             .unwrap_or(&dbc)
             .to_string_lossy()
             .into_owned();
-        // A malformed/unreadable DBC must not blank the model — skip just it.
-        let _ = p.augment_dbc(&dbc, &rel);
+        match p.augment_dbc(&dbc, &rel) {
+            Ok(()) => report.loaded_dbcs.push(path_string(&dbc)),
+            Err(error) => {
+                report.dbc_state = DbcLoadState::Partial;
+                report.skipped_dbcs.push(SkippedInput {
+                    path: path_string(&dbc),
+                    error: error.to_string(),
+                });
+            }
+        }
     }
-    Ok(p)
-}
 
-/// Parse every `.m1scr` under the project directory, named by file name (the
-/// key the project uses to map a script to its group/function), matching the
-/// CLI's whole-project pass set.
-pub fn gather_project_scripts(project_path: &Path) -> Vec<ParsedScript> {
-    gather_project_scripts_with_inline(project_path, None)
-}
-
-/// Parse every project script while replacing the script identified by
-/// `inline` with request-provided source. Matching uses the filename because
-/// that is how `Project.m1prj` maps scripts to functions. If no on-disk file
-/// has that name, the inline script is still added to the project-wide set.
-/// The logical path is never read.
-pub fn gather_project_scripts_with_inline(
-    project_path: &Path,
-    inline: Option<(&Path, &str)>,
-) -> Vec<ParsedScript> {
-    let Some(root) = project_path.parent() else {
-        return Vec::new();
-    };
+    let mut sources = Vec::new();
     let inline_name = inline.and_then(|(path, _)| path.file_name()?.to_str());
     let mut replaced_inline = false;
-    let mut pairs: Vec<(String, String)> = m1_workspace::find_scripts(root)
-        .iter()
-        .filter_map(|f| {
-            let name = f.file_name()?.to_str()?.to_string();
-            let source = match inline {
-                Some((_, source)) if Some(name.as_str()) == inline_name => {
-                    replaced_inline = true;
-                    source.to_string()
-                }
-                _ => m1_workspace::read_text(f).ok()?,
-            };
-            Some((name, source))
-        })
-        .collect();
-
-    if !replaced_inline && let (Some(name), Some((_, source))) = (inline_name, inline) {
-        pairs.push((name.to_string(), source.to_string()));
+    for script in m1_workspace::find_scripts(dir) {
+        let Some(name) = script.file_name().and_then(|name| name.to_str()) else {
+            report.skipped_scripts.push(SkippedInput {
+                path: path_string(&script),
+                error: "script file name is not valid UTF-8".to_string(),
+            });
+            continue;
+        };
+        let source = match inline {
+            Some((_, source)) if Some(name) == inline_name => {
+                replaced_inline = true;
+                Ok(source.to_string())
+            }
+            _ => m1_workspace::read_text(&script).map_err(|error| error.to_string()),
+        };
+        match source {
+            Ok(source) => sources.push((name.to_string(), source)),
+            Err(error) => report.skipped_scripts.push(SkippedInput {
+                path: path_string(&script),
+                error,
+            }),
+        }
     }
-    parsed::parse_all(&pairs)
+    if !replaced_inline && let (Some(name), Some((_, source))) = (inline_name, inline) {
+        sources.push((name.to_string(), source.to_string()));
+    }
+    let scripts = parsed::parse_all(&sources);
+    report.script_count = scripts.len();
+
+    Ok(LoadedProject {
+        project: p,
+        scripts,
+        report,
+    })
 }

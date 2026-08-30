@@ -16,12 +16,12 @@ having the CLIs installed on your `PATH`.
 | --- | --- |
 | `m1_doc_search` | Search the M1 builtin catalogue — library functions, project-object methods, firmware enumerations, package classes, data types — and get ranked matches with signatures and docs. |
 | `m1_doc_lookup` | Full detail for one exact builtin name: every overload of a function, all members of an enum, a class summary, or a data type. |
-| `m1_typecheck` | Type-check M1 source (inline text or a file path), returning diagnostics with code, severity and line/column. Pass a `Project.m1prj` to enable cross-script and reference-keyword checks. |
+| `m1_typecheck` | Type-check M1 source (inline text or a file path), returning diagnostics with code, severity and line/column. Pass a `Project.m1prj` to enable cross-script and reference-keyword checks and receive a project-load report. |
 | `m1_lint` | Lint M1 source with the project-configured `L0xx` rules. Findings include stable rule names and fixability. Optional fix mode returns verified fixed text without writing files. |
 | `m1_lint_rule` | Look up one exact `L0xx` code and return its severity, default state, fixability, summary, and full explanation. |
 | `m1_format` | Format M1 source to the M1 style, or (in `check_only` mode) just report whether it is already formatted. |
-| `m1_symbols` | Load a `Project.m1prj` and list its workspace symbols — channels, parameters, constants, functions, tables, objects — with kind, value type, unit and security. |
-| `m1_can` | Inspect a project's CAN setup: every `.m1dbc` module with the bus a script binds it to, every message with its CAN id, and each repeated id judged `same-bus`, `different-bus` or `unknown`. |
+| `m1_symbols` | Load a `Project.m1prj` and list its workspace symbols — channels, parameters, constants, functions, tables, objects — with kind, value type, unit, security and a project-load report. |
+| `m1_can` | Inspect a project's CAN setup: every `.m1dbc` module with the bus a script binds it to, every message with its CAN id, and each repeated id judged `same-bus`, `different-bus` or `unknown`. The response also reports project inputs that could not be loaded. |
 
 The `m1_can` handler delegates in-process to the versioned
 [`m1-can`](https://github.com/nedlane/m1-can) library. The CLI, MCP server, and
@@ -64,6 +64,19 @@ a verdict resting on one is marked `depends_on_calibration: true`: it holds for
 the loaded calibration and a retune can change it. Verdicts from literals and
 project constants alone are retune-proof. Two modules bound to the *same* symbol
 are the same bus either way.
+
+### Project-load reports
+
+Every project-backed result includes `load_report`. It names the main project,
+the discovered parameter configuration, each successfully loaded `.m1dbc`, and
+the number of readable scripts. Missing configuration and a project with no DBC
+files are separate explicit states.
+
+A malformed main `Project.m1prj` remains a tool error. A malformed auxiliary
+DBC or unreadable script does not discard the usable model: the response keeps
+the partial result and lists every skipped path with its error. Treat a result
+with skipped inputs as partial, even when its diagnostics or CAN overlaps are
+otherwise empty.
 
 The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary

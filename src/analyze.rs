@@ -13,8 +13,7 @@ use std::path::{Path, PathBuf};
 use m1_core::{Diagnostic, Severity};
 use m1_lint::diagnostic::LintCode;
 use m1_typecheck::cross_script::{self, ChannelTaints};
-use m1_typecheck::diagnostics::{RelatedLocation, RelatedPlace, TypeDiagnostic};
-use m1_typecheck::project::Project;
+use m1_typecheck::diagnostics::{RelatedPlace, TypeDiagnostic};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -125,7 +124,6 @@ fn type_to_dto(
     scope: DiagnosticScope,
     source: DiagnosticSourceDto,
     project_path: Option<&Path>,
-    project: Option<&Project>,
 ) -> Result<DiagnosticDto, String> {
     let mut dto = to_dto(diagnostic.code.as_str(), &diagnostic.inner, scope, source);
     dto.subject.clone_from(&diagnostic.subject);
@@ -133,131 +131,35 @@ fn type_to_dto(
         .related
         .iter()
         .map(|related| {
-            let RelatedPlace::Project { line } = related.place;
-            let path = resolve_related_path_v050(diagnostic, related, line, project_path, project)?;
+            let project_path = project_path.ok_or_else(|| {
+                format!(
+                    "{} diagnostic carries a related location without a project path",
+                    diagnostic.code.as_str()
+                )
+            })?;
+            let (path, line) = match &related.place {
+                RelatedPlace::Project { line } => (project_path.to_path_buf(), *line),
+                RelatedPlace::Dbc { path, line } => {
+                    let path = Path::new(path);
+                    let path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        project_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .join(path)
+                    };
+                    (path, *line)
+                }
+            };
             Ok(RelatedLocationDto {
-                path,
+                path: path.display().to_string(),
                 line: line + 1,
                 message: related.message.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(dto)
-}
-
-/// Resolve the file behind m1-typecheck's project-related location.
-///
-/// In m1-typecheck v0.50.0, `RelatedPlace::Project` carries only a line even
-/// though the declaration may live in `Project.m1prj` or a loaded `.m1dbc`.
-/// Current related-location producers include the defining symbol path (full
-/// or script-relative) in backticks, so resolve those complete tokens against
-/// the active symbol table
-/// and require one unambiguous defining file. This deliberately fails closed
-/// instead of sending an agent to a plausible but incorrect path. Remove this
-/// compatibility shim once upstream carries structured file identity.
-fn resolve_related_path_v050(
-    diagnostic: &TypeDiagnostic,
-    related: &RelatedLocation,
-    line: u32,
-    project_path: Option<&Path>,
-    project: Option<&Project>,
-) -> Result<String, String> {
-    let project_path = project_path.ok_or_else(|| {
-        format!(
-            "{} diagnostic carries a project related location without a project path",
-            diagnostic.code.as_str()
-        )
-    })?;
-    let project = project.ok_or_else(|| {
-        format!(
-            "{} diagnostic carries a project related location without a loaded project",
-            diagnostic.code.as_str()
-        )
-    })?;
-
-    let tokens: Vec<&str> = related.message.split('`').skip(1).step_by(2).collect();
-    // T098 quotes the descriptive argument name before the defining function.
-    // Other v0.50.0 producers put the defining symbol first; notably T030 may
-    // later quote an enum type in the rendered target type.
-    let token = match diagnostic.code.as_str() {
-        "T098" => tokens.last(),
-        _ => tokens.first(),
-    }
-    .copied()
-    .ok_or_else(|| {
-        format!(
-            "{} related location at project line {} does not name a defining symbol",
-            diagnostic.code.as_str(),
-            line + 1
-        )
-    })?;
-    let mut symbol_paths: Vec<String> = Vec::new();
-    if let Some(symbol) = project.symbols().get(token) {
-        symbol_paths.push(symbol.path.clone());
-    } else {
-        // A few producers render a path relative to the checked script's
-        // group (for example `Helper` for `Root.Ctrl.Helper`). Only pay for a
-        // suffix scan when the structured exact lookup fails.
-        let suffix = format!(".{token}");
-        symbol_paths.extend(
-            project
-                .symbols()
-                .iter()
-                .filter(|symbol| symbol.path.ends_with(&suffix))
-                .map(|symbol| symbol.path.clone()),
-        );
-    }
-    symbol_paths.sort();
-    symbol_paths.dedup();
-
-    let mut paths: Vec<PathBuf> = symbol_paths
-        .iter()
-        // SymbolTable may retain superseded entries; `get` returns the active
-        // last-writer symbol used by type resolution.
-        .filter_map(|path| project.symbols().get(path))
-        .filter(|symbol| symbol.def_line == Some(line))
-        .map(|symbol| {
-            symbol
-                .filename
-                .as_deref()
-                .filter(|filename| {
-                    Path::new(filename)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("m1dbc"))
-                })
-                .map_or_else(
-                    || project_path.to_path_buf(),
-                    |filename| {
-                        project_path
-                            .parent()
-                            .unwrap_or_else(|| Path::new(""))
-                            .join(filename)
-                    },
-                )
-        })
-        .collect();
-    paths.sort();
-    paths.dedup();
-
-    match paths.as_slice() {
-        [path] => Ok(path.display().to_string()),
-        [] => Err(format!(
-            "{} related location at project line {} does not identify a defining symbol",
-            diagnostic.code.as_str(),
-            line + 1
-        )),
-        _ => Err(format!(
-            "{} related location at project line {} resolves to multiple files: {}",
-            diagnostic.code.as_str(),
-            line + 1,
-            paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
 }
 
 /// Where the source to analyse comes from.
@@ -336,6 +238,10 @@ pub struct TypecheckOutcome {
     /// True when a `Project.m1prj` was loaded so cross-script/reference checks
     /// could run; false for a standalone snippet.
     pub project_loaded: bool,
+    /// Exact auxiliary inputs that contributed to the project model. Omitted
+    /// for standalone source checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_report: Option<loader::ProjectLoadReport>,
 }
 
 /// Type-check `input`. If `project_path` names a `Project.m1prj`, it is loaded
@@ -359,9 +265,19 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         loader::check_project_script_budget(pp)?;
     }
 
+    let inline = if resolved.inline {
+        resolved
+            .script_path
+            .map(|path| (path, resolved.source.as_str()))
+    } else {
+        None
+    };
+
     // Load the project fully (m1cfg + .m1dbc), not a bare `Project::load`.
-    let mut project = match project_path {
-        Some(p) => Some(loader::load_project_full(p)?),
+    // Request-provided source replaces its on-disk counterpart in the shared
+    // script snapshot without reading the logical context path.
+    let mut loaded = match project_path {
+        Some(p) => Some(loader::load_project_full_with_inline(p, inline)?),
         None => None,
     };
 
@@ -371,31 +287,42 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     // T080/T081, inferred return types, and the T088–T107 project audits, so a
     // project the tool claims to check came back falsely clean.
     let mut project_diags: Vec<DiagnosticDto> = Vec::new();
-    let channels = match (project.as_mut(), project_path) {
-        (Some(p), Some(pp)) => {
-            let inline = if resolved.inline {
-                resolved
-                    .script_path
-                    .map(|path| (path, resolved.source.as_str()))
-            } else {
-                None
-            };
-            let scripts = loader::gather_project_scripts_with_inline(pp, inline);
-            p.infer_return_types(&scripts);
-            let channels = cross_script::solve(p, &scripts);
+    let channels = match (loaded.as_mut(), project_path) {
+        (Some(loaded), Some(pp)) => {
+            loaded.project.infer_return_types(&loaded.scripts);
+            let channels = cross_script::solve(&loaded.project, &loaded.scripts);
 
             let mut pd: Vec<TypeDiagnostic> = Vec::new();
             // Default-on passes, matching the CLI (T089 rate-inversion stays off).
             pd.extend(m1_typecheck::schedule::check(
-                p, &scripts, true, false, true,
+                &loaded.project,
+                &loaded.scripts,
+                true,
+                false,
+                true,
             ));
-            pd.extend(m1_typecheck::schedule::check_usage(p, &scripts, true, true));
-            pd.extend(m1_typecheck::schedule::check_multi_writers(p, &scripts));
+            pd.extend(m1_typecheck::schedule::check_usage(
+                &loaded.project,
+                &loaded.scripts,
+                true,
+                true,
+            ));
+            pd.extend(m1_typecheck::schedule::check_multi_writers(
+                &loaded.project,
+                &loaded.scripts,
+            ));
             pd.extend(m1_typecheck::schedule::check_cross_fn_assignment(
-                p, &scripts,
+                &loaded.project,
+                &loaded.scripts,
             ));
-            pd.extend(m1_typecheck::schedule::check_reachability(p, &scripts));
-            pd.extend(m1_typecheck::dbc_init::check(p, &scripts));
+            pd.extend(m1_typecheck::schedule::check_reachability(
+                &loaded.project,
+                &loaded.scripts,
+            ));
+            pd.extend(m1_typecheck::dbc_init::check(
+                &loaded.project,
+                &loaded.scripts,
+            ));
             project_diags = pd
                 .iter()
                 .map(|diagnostic| {
@@ -404,7 +331,6 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                         DiagnosticScope::Project,
                         source_dto(Some(pp)),
                         Some(pp),
-                        Some(&*p),
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -417,7 +343,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     let enabled: HashSet<String> = HashSet::new();
     let result = m1_typecheck::rules::check_script_with_channels(
         &enabled,
-        project.as_ref(),
+        loaded.as_ref().map(|loaded| &loaded.project),
         resolved.script_path,
         &resolved.source,
         &channels,
@@ -445,7 +371,6 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                     DiagnosticScope::Source,
                     input_source.clone(),
                     project_path,
-                    project.as_ref(),
                 )
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -458,11 +383,14 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         .filter(|d| d.severity == "warning")
         .count();
 
+    let project_loaded = loaded.is_some();
+    let load_report = loaded.map(|loaded| loaded.report);
     Ok(TypecheckOutcome {
         diagnostics,
         error_count,
         warning_count,
-        project_loaded: project.is_some(),
+        project_loaded,
+        load_report,
     })
 }
 

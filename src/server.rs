@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::analyze::{self, Input};
-use crate::{doc, symbols};
+use crate::{can, doc, symbols};
 
 /// Guidance surfaced to the agent on connect.
 const INSTRUCTIONS: &str = "\
@@ -200,7 +200,7 @@ impl M1Server {
 
     /// Type-check M1 script, returning diagnostics.
     #[tool(
-        description = "Type-check M1 script (inline `source` or a file `path`), returning source/project-scoped diagnostics with paths, exact position/byte ranges, project subjects, and related declaration locations. For inline source, optional `context_path` supplies the logical script filename without reading it while diagnostics remain explicitly inline. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks."
+        description = "Type-check M1 script (inline `source` or a file `path`), returning source/project-scoped diagnostics with paths, exact position/byte ranges, project subjects, and related declaration locations. For inline source, optional `context_path` supplies the logical script filename without reading it while diagnostics remain explicitly inline. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks and receive a load report naming skipped auxiliary inputs."
     )]
     async fn m1_typecheck(
         &self,
@@ -270,7 +270,7 @@ impl M1Server {
 
     /// List a project's workspace symbols.
     #[tool(
-        description = "Load a Project.m1prj and list its workspace symbols (channels, parameters, constants, functions, tables, objects) with kind, value type, unit, and security. Optional case-insensitive path `filter`."
+        description = "Load a Project.m1prj and list its workspace symbols (channels, parameters, constants, functions, tables, objects) with kind, value type, unit, security, and a report naming every loaded or skipped auxiliary input. Optional case-insensitive path `filter`."
     )]
     async fn m1_symbols(
         &self,
@@ -288,13 +288,13 @@ impl M1Server {
     /// Report the project's CAN model: DBC modules, the bus each is `Init`-ed
     /// on, and whether repeated CAN ids actually clash.
     #[tool(
-        description = "Inspect a project's CAN setup. Returns every `.m1dbc` module with the CAN bus a script binds it to (`DBC.<Name>.Init(<bus>)` — a DBC has NO bus until then, M1 Build Error 1375), every message with its CAN id and bus, and each repeated CAN id judged `same-bus` (a real clash), `different-bus` (proven safe — same id on separate buses is not a conflict) or `unknown` (bus is a parameter/expression, so nothing is proven). Use this for any CAN id / bus question instead of reading the .m1dbc files."
+        description = "Inspect a project's CAN setup. Returns every loaded `.m1dbc` module with the CAN bus a script binds it to (`DBC.<Name>.Init(<bus>)` — a DBC has NO bus until then, M1 Build Error 1375), every message with its CAN id and bus, and each repeated CAN id judged `same-bus` (a real clash), `different-bus` (proven safe — same id on separate buses is not a conflict) or `unknown` (bus is a parameter/expression, so nothing is proven). The load report names malformed DBCs and unreadable scripts so an omitted input cannot look clean. Use this for any CAN id / bus question instead of reading the .m1dbc files."
     )]
     async fn m1_can(
         &self,
         Parameters(p): Parameters<CanParams>,
-    ) -> Result<Json<m1_can::CanOutcome>, ErrorData> {
-        m1_can::inspect(
+    ) -> Result<Json<can::CanOutcome>, ErrorData> {
+        can::inspect(
             &PathBuf::from(&p.project),
             p.filter.as_deref(),
             p.limit.unwrap_or(200),
