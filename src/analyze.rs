@@ -313,6 +313,10 @@ pub struct TypecheckOutcome {
     /// True when a `Project.m1prj` was loaded so cross-script/reference checks
     /// could run; false for a standalone snippet.
     pub project_loaded: bool,
+    /// Exact auxiliary inputs that contributed to the project model. Omitted
+    /// for standalone source checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_report: Option<loader::ProjectLoadReport>,
 }
 
 /// Type-check `input`. If `project_path` names a `Project.m1prj`, it is loaded
@@ -330,7 +334,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     }
 
     // Load the project fully (m1cfg + .m1dbc), not a bare `Project::load`.
-    let mut project = match project_path {
+    let mut loaded = match project_path {
         Some(p) => Some(loader::load_project_full(p)?),
         None => None,
     };
@@ -341,24 +345,42 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     // T080/T081, inferred return types, and the T088–T107 project audits, so a
     // project the tool claims to check came back falsely clean.
     let mut project_diags: Vec<DiagnosticDto> = Vec::new();
-    let channels = match (project.as_mut(), project_path) {
-        (Some(p), Some(pp)) => {
-            let scripts = loader::gather_project_scripts(pp);
-            p.infer_return_types(&scripts);
-            let channels = cross_script::solve(p, &scripts);
+    let channels = match (loaded.as_mut(), project_path) {
+        (Some(loaded), Some(pp)) => {
+            loaded.project.infer_return_types(&loaded.scripts);
+            let channels = cross_script::solve(&loaded.project, &loaded.scripts);
 
             let mut pd: Vec<TypeDiagnostic> = Vec::new();
             // Default-on passes, matching the CLI (T089 rate-inversion stays off).
             pd.extend(m1_typecheck::schedule::check(
-                p, &scripts, true, false, true,
+                &loaded.project,
+                &loaded.scripts,
+                true,
+                false,
+                true,
             ));
-            pd.extend(m1_typecheck::schedule::check_usage(p, &scripts, true, true));
-            pd.extend(m1_typecheck::schedule::check_multi_writers(p, &scripts));
+            pd.extend(m1_typecheck::schedule::check_usage(
+                &loaded.project,
+                &loaded.scripts,
+                true,
+                true,
+            ));
+            pd.extend(m1_typecheck::schedule::check_multi_writers(
+                &loaded.project,
+                &loaded.scripts,
+            ));
             pd.extend(m1_typecheck::schedule::check_cross_fn_assignment(
-                p, &scripts,
+                &loaded.project,
+                &loaded.scripts,
             ));
-            pd.extend(m1_typecheck::schedule::check_reachability(p, &scripts));
-            pd.extend(m1_typecheck::dbc_init::check(p, &scripts));
+            pd.extend(m1_typecheck::schedule::check_reachability(
+                &loaded.project,
+                &loaded.scripts,
+            ));
+            pd.extend(m1_typecheck::dbc_init::check(
+                &loaded.project,
+                &loaded.scripts,
+            ));
             project_diags = pd
                 .iter()
                 .map(|diagnostic| {
@@ -367,7 +389,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                         DiagnosticScope::Project,
                         source_dto(Some(pp)),
                         Some(pp),
-                        Some(&*p),
+                        Some(&loaded.project),
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -380,7 +402,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
     let enabled: HashSet<String> = HashSet::new();
     let result = m1_typecheck::rules::check_script_with_channels(
         &enabled,
-        project.as_ref(),
+        loaded.as_ref().map(|loaded| &loaded.project),
         script_path,
         &source,
         &channels,
@@ -408,7 +430,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                     DiagnosticScope::Source,
                     input_source.clone(),
                     project_path,
-                    project.as_ref(),
+                    loaded.as_ref().map(|loaded| &loaded.project),
                 )
             })
             .collect::<Result<Vec<_>, String>>()?,
@@ -421,11 +443,14 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         .filter(|d| d.severity == "warning")
         .count();
 
+    let project_loaded = loaded.is_some();
+    let load_report = loaded.map(|loaded| loaded.report);
     Ok(TypecheckOutcome {
         diagnostics,
         error_count,
         warning_count,
-        project_loaded: project.is_some(),
+        project_loaded,
+        load_report,
     })
 }
 

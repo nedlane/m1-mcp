@@ -4,7 +4,7 @@
 
 use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input};
 use m1_mcp::doc::{self, DocKind};
-use m1_mcp::{limits, loader};
+use m1_mcp::{can, limits, loader, symbols};
 
 // ---- doc reference --------------------------------------------------------
 
@@ -70,6 +70,35 @@ fn doc_lookup_expands_enum_members() {
 
 /// A tiny well-formed M1 script body used across the analyser tests.
 const GOOD: &str = "Engine Speed Warning is True\n";
+
+const MINIMAL_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Load Report" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Test"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#;
+
+const EMPTY_CONFIG: &str = r#"<?xml version="1.0"?>
+<Configuration><Group Name=""/></Configuration>
+"#;
+
+const VALID_DBC: &str = r#"<?xml version="1.0"?>
+<DBC><ComponentStream><List>
+ <Component Classname="BuiltIn.CAN.DBC" Name="Good"/>
+ <Component Classname="BuiltIn.CAN.Message" Name="Good.Status">
+  <Props CANId="100" DLC="8" Transmit="RX"/>
+ </Component>
+</List></ComponentStream></DBC>
+"#;
+
+fn write_minimal_project(dir: &std::path::Path) -> std::path::PathBuf {
+    let project = dir.join("Project.m1prj");
+    std::fs::write(&project, MINIMAL_PROJECT).unwrap();
+    project
+}
 
 #[test]
 fn typecheck_reports_no_error_count_for_reasonable_source() {
@@ -466,6 +495,157 @@ fn project_script_budget_allows_small_tree() {
         std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
     }
     assert!(loader::check_project_script_budget(&proj).is_ok());
+}
+
+#[test]
+fn project_load_report_makes_missing_inputs_explicit() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    std::fs::write(dir.path().join("Test.Update.m1scr"), GOOD).unwrap();
+
+    let loaded = loader::load_project_full(&project).expect("project loads");
+    assert_eq!(loaded.report.project, project.to_string_lossy());
+    assert_eq!(
+        loaded.report.configuration,
+        loader::ConfigurationLoad::Missing
+    );
+    assert_eq!(loaded.report.dbc_state, loader::DbcLoadState::NoneFound);
+    assert_eq!(loaded.report.script_count, 1);
+    assert!(loaded.report.loaded_dbcs.is_empty());
+    assert!(loaded.report.skipped_dbcs.is_empty());
+    assert!(loaded.report.skipped_scripts.is_empty());
+
+    let json = serde_json::to_value(&loaded.report).unwrap();
+    assert_eq!(json["configuration"]["state"], "missing");
+    assert_eq!(json["dbc_state"], "none_found");
+}
+
+#[test]
+fn project_load_report_names_loaded_and_skipped_auxiliary_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    let config = dir.path().join("parameters.m1cfg");
+    let good_dbc = dir.path().join("good.m1dbc");
+    let bad_dbc = dir.path().join("bad.m1dbc");
+    std::fs::write(&config, EMPTY_CONFIG).unwrap();
+    std::fs::write(&good_dbc, VALID_DBC).unwrap();
+    std::fs::write(&bad_dbc, "<not-closed").unwrap();
+
+    let loaded = loader::load_project_full(&project).expect("partial project loads");
+    assert_eq!(
+        loaded.report.configuration,
+        loader::ConfigurationLoad::Loaded {
+            path: config.to_string_lossy().into_owned(),
+        }
+    );
+    assert_eq!(loaded.report.dbc_state, loader::DbcLoadState::Partial);
+    assert_eq!(
+        loaded.report.loaded_dbcs,
+        vec![good_dbc.to_string_lossy().into_owned()]
+    );
+    assert_eq!(loaded.report.skipped_dbcs.len(), 1);
+    assert_eq!(
+        loaded.report.skipped_dbcs[0].path,
+        bad_dbc.to_string_lossy()
+    );
+    assert!(!loaded.report.skipped_dbcs[0].error.is_empty());
+    assert!(
+        loaded
+            .project
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.path == "Good.Status"),
+        "successfully loaded DBC data must remain in the partial model"
+    );
+}
+
+#[test]
+fn project_load_report_names_unreadable_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    std::fs::write(dir.path().join("readable.m1scr"), GOOD).unwrap();
+    let oversized = dir.path().join("oversized.m1scr");
+    let file = std::fs::File::create(&oversized).unwrap();
+    file.set_len(m1_workspace::MAX_TEXT_FILE_BYTES + 1).unwrap();
+
+    let loaded = loader::load_project_full(&project).expect("project stays usable");
+    assert_eq!(loaded.report.script_count, 1);
+    assert_eq!(loaded.report.skipped_scripts.len(), 1);
+    assert_eq!(
+        loaded.report.skipped_scripts[0].path,
+        oversized.to_string_lossy()
+    );
+    assert!(
+        loaded.report.skipped_scripts[0]
+            .error
+            .contains("read limit")
+    );
+}
+
+#[test]
+fn malformed_main_project_remains_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(&project, "<not-closed").unwrap();
+
+    let error = loader::load_project_full(&project)
+        .err()
+        .expect("malformed main project must fail");
+    assert!(error.contains("failed to load project"), "{error}");
+    assert!(
+        analyze::typecheck(&Input::Inline(GOOD.to_string()), Some(&project)).is_err(),
+        "the MCP analyser must surface the load failure as a tool error"
+    );
+}
+
+#[test]
+fn project_tools_expose_the_shared_load_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    std::fs::write(dir.path().join("Test.Update.m1scr"), GOOD).unwrap();
+
+    let checked = analyze::typecheck(&Input::Inline(GOOD.to_string()), Some(&project))
+        .expect("typecheck runs");
+    assert_eq!(checked.load_report.as_ref().unwrap().script_count, 1);
+
+    let listed = symbols::list(&project, None, 200).expect("symbols run");
+    assert_eq!(listed.load_report.script_count, 1);
+
+    let inspected = can::inspect(&project, None, 200).expect("CAN inspection runs");
+    assert_eq!(inspected.load_report.script_count, 1);
+    let json = serde_json::to_value(inspected).unwrap();
+    assert!(json.get("modules").is_some(), "CAN fields stay top-level");
+    assert!(json.get("load_report").is_some());
+    assert!(
+        json.get("can").is_none(),
+        "the wrapper must remain flattened"
+    );
+
+    let schema = serde_json::to_value(schemars::schema_for!(can::CanOutcome)).unwrap();
+    assert_eq!(schema["type"], "object");
+    assert!(schema["properties"].get("modules").is_some());
+    assert!(schema["properties"].get("load_report").is_some());
+}
+
+#[test]
+fn malformed_auxiliary_dbc_returns_partial_can_result_with_warning_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    let bad_dbc = dir.path().join("bad.m1dbc");
+    std::fs::write(&bad_dbc, "<not-closed").unwrap();
+
+    let inspected = can::inspect(&project, None, 200)
+        .expect("a malformed auxiliary DBC must not blank the CAN result");
+    assert_eq!(
+        inspected.load_report.dbc_state,
+        loader::DbcLoadState::Partial
+    );
+    assert_eq!(inspected.load_report.skipped_dbcs.len(), 1);
+    assert_eq!(
+        inspected.load_report.skipped_dbcs[0].path,
+        bad_dbc.to_string_lossy()
+    );
+    assert_eq!(inspected.can.total_messages, 0);
 }
 
 #[test]
