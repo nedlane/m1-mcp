@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::analyze::{self, Input};
-use crate::{can, doc, symbols};
+use crate::{can, completeness, doc, symbols};
 
 /// Guidance surfaced to the agent on connect.
 const INSTRUCTIONS: &str = "\
@@ -23,7 +23,9 @@ run `m1_typecheck`, `m1_lint`, and `m1_format` (check_only) on it. Pass either i
 `source` or a file `path`. With inline source, `context_path` supplies the unsaved \
 buffer's logical script path for project resolution and config discovery without reading \
 that file. Give `project` (a Project.m1prj) to enable cross-script and reference-keyword \
-checks. `m1_lint` can return a safe fixed source without writing the file; use \
+checks. Use `m1_completeness` before treating zero diagnostics as proof: it reports unknown \
+types, opaque references, unmodelled intrinsics, and skipped scripts. `m1_lint` can return \
+a safe fixed source without writing the file; use \
 `m1_lint_rule` for the rationale and fix behavior of an exact L-code. `m1_symbols` lists a \
 project's channels/parameters/functions.
 CAN: never judge CAN traffic from the `.m1dbc` files alone — a DBC carries no bus until a script \
@@ -61,6 +63,24 @@ fn make_input(
     }
 }
 
+/// Validate an optional catalogue target before doing any project or source
+/// work. The JSON-RPC error carries both a concise message and machine-readable
+/// target data so clients can retry without parsing prose.
+fn validate_firmware(requested: Option<&str>) -> Result<&'static str, ErrorData> {
+    match requested {
+        None => Ok(m1_typecheck::intrinsics::active_target()),
+        Some(requested) => m1_typecheck::intrinsics::resolve_target(requested).map_err(|message| {
+            ErrorData::invalid_params(
+                message,
+                Some(serde_json::json!({
+                    "requested": requested,
+                    "known_targets": m1_typecheck::intrinsics::known_targets(),
+                })),
+            )
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DocSearchParams {
     /// Text to search for across builtin function names, enum members, class
@@ -69,6 +89,10 @@ pub struct DocSearchParams {
     /// Maximum number of matches to return (default 20).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Optional firmware/manual catalogue target. Unknown targets are rejected
+    /// with the list of targets embedded in this binary.
+    #[serde(default)]
+    pub firmware: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -77,6 +101,9 @@ pub struct DocLookupParams {
     /// `Choose`), an object method, an enum type (members expanded), an enum
     /// member, a class, or a data type.
     pub name: String,
+    /// Optional firmware/manual catalogue target.
+    #[serde(default)]
+    pub firmware: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -117,6 +144,9 @@ pub struct TypecheckParams {
     /// checked standalone.
     #[serde(default)]
     pub project: Option<String>,
+    /// Optional firmware/manual catalogue target.
+    #[serde(default)]
+    pub firmware: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -163,6 +193,19 @@ pub struct CanParams {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CompletenessParams {
+    /// Path to a `Project.m1prj`.
+    pub project: String,
+    /// Optional case-insensitive substring used to retain matching script
+    /// filenames in the coverage report.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Optional firmware/manual catalogue target.
+    #[serde(default)]
+    pub firmware: Option<String>,
+}
+
 /// The M1 toolchain MCP server.
 #[derive(Debug, Clone, Default)]
 pub struct M1Server;
@@ -177,40 +220,58 @@ impl M1Server {
     /// types) for a term. Use this to find the right builtin and confirm its
     /// name before writing script.
     #[tool(
-        description = "Search the M1 builtin catalogue (library functions, project-object methods, firmware enums, package classes, data types) for a term. Returns ranked matches with signature and docs."
+        description = "Search the M1 builtin catalogue (library functions, project-object methods, firmware enums, package classes, data types) for a term. Returns ranked matches with signatures, docs, and `catalogue_target`. Optional `firmware` asserts the expected target."
     )]
     async fn m1_doc_search(
         &self,
         Parameters(p): Parameters<DocSearchParams>,
-    ) -> Json<doc::DocResults> {
-        Json(doc::search(&p.query, p.limit.unwrap_or(20)).into())
+    ) -> Result<Json<doc::DocResults>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
+        Ok(Json(doc::search(&p.query, p.limit.unwrap_or(20)).into()))
     }
 
     /// Look up full detail for one exact M1 builtin name (all overloads, params,
     /// enum members, or class doc).
     #[tool(
-        description = "Look up full detail for one exact M1 builtin name: a library function (all overloads), an object method, an enum type (members expanded), an enum member, a class, or a data type."
+        description = "Look up full detail for one exact M1 builtin name: a library function (all overloads), an object method, an enum type (members expanded), an enum member, a class, or a data type. Returns `catalogue_target`; optional `firmware` asserts it."
     )]
     async fn m1_doc_lookup(
         &self,
         Parameters(p): Parameters<DocLookupParams>,
-    ) -> Json<doc::DocResults> {
-        Json(doc::lookup(&p.name).into())
+    ) -> Result<Json<doc::DocResults>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
+        Ok(Json(doc::lookup(&p.name).into()))
     }
 
     /// Type-check M1 script, returning diagnostics.
     #[tool(
-        description = "Type-check M1 script (inline `source` or a file `path`), returning source/project-scoped diagnostics with paths, exact position/byte ranges, project subjects, and related declaration locations. For inline source, optional `context_path` supplies the logical script filename without reading it while diagnostics remain explicitly inline. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks and receive a load report naming skipped auxiliary inputs."
+        description = "Type-check M1 script (inline `source` or a file `path`), returning source/project-scoped diagnostics with paths, exact position/byte ranges, project subjects, related declaration locations, and `catalogue_target`. For inline source, optional `context_path` supplies the logical script filename without reading it while diagnostics remain explicitly inline. Optional `firmware` asserts the expected target. Pass `project` (a Project.m1prj) to enable cross-script and reference-keyword checks and receive a load report naming skipped auxiliary inputs."
     )]
     async fn m1_typecheck(
         &self,
         Parameters(p): Parameters<TypecheckParams>,
     ) -> Result<Json<analyze::TypecheckOutcome>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
         let input = make_input(p.source, p.path, p.context_path)?;
         let project = p.project.map(PathBuf::from);
         analyze::typecheck(&input, project.as_deref())
             .map(Json)
             .map_err(|e| ErrorData::invalid_params(e, None))
+    }
+
+    /// Report how much of a project's source the analyser could type and
+    /// resolve. This is telemetry, not a finding gate.
+    #[tool(
+        description = "Report analysis completeness for a Project.m1prj: analysed and skipped scripts, typed expressions, resolved/opaque/unresolved references, intrinsic catalogue coverage, incomplete `when` subjects, input-load state, and the active firmware target. Optional `filter` is a case-insensitive script-filename substring."
+    )]
+    async fn m1_completeness(
+        &self,
+        Parameters(p): Parameters<CompletenessParams>,
+    ) -> Result<Json<completeness::CompletenessOutcome>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
+        completeness::analyze_project(&PathBuf::from(&p.project), p.filter.as_deref())
+            .map(Json)
+            .map_err(|error| ErrorData::invalid_params(error, None))
     }
 
     /// Lint M1 script with the resolved rule set, optionally returning a safe
@@ -381,5 +442,27 @@ mod tests {
             Some("Scripts/Other.Update.m1scr".to_string()),
         );
         assert!(result.is_err(), "path plus context_path must be ambiguous");
+    }
+
+    #[test]
+    fn unknown_firmware_is_a_structured_invalid_params_error() {
+        let requested = "m1-build-no-such-target";
+        let error = validate_firmware(Some(requested)).expect_err("unknown target must fail");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("known targets"));
+
+        let data = error.data.expect("target choices are machine-readable");
+        assert_eq!(data["requested"], requested);
+        assert_eq!(
+            data["known_targets"],
+            serde_json::json!(m1_typecheck::intrinsics::known_targets())
+        );
+    }
+
+    #[test]
+    fn active_firmware_is_accepted() {
+        let active = m1_typecheck::intrinsics::active_target();
+        assert_eq!(validate_firmware(None).unwrap(), active);
+        assert_eq!(validate_firmware(Some(active)).unwrap(), active);
     }
 }

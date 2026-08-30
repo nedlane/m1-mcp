@@ -34,6 +34,8 @@ pub enum DocKind {
 /// not a bare array.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DocResults {
+    /// Firmware/manual target represented by the embedded catalogue.
+    pub catalogue_target: String,
     pub count: usize,
     pub matches: Vec<DocEntry>,
 }
@@ -41,6 +43,7 @@ pub struct DocResults {
 impl From<Vec<DocEntry>> for DocResults {
     fn from(matches: Vec<DocEntry>) -> Self {
         DocResults {
+            catalogue_target: intrinsics::active_target().to_string(),
             count: matches.len(),
             matches,
         }

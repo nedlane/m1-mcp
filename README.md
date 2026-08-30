@@ -17,6 +17,7 @@ having the CLIs installed on your `PATH`.
 | `m1_doc_search` | Search the M1 builtin catalogue — library functions, project-object methods, firmware enumerations, package classes, data types — and get ranked matches with signatures and docs. |
 | `m1_doc_lookup` | Full detail for one exact builtin name: every overload of a function, all members of an enum, a class summary, or a data type. |
 | `m1_typecheck` | Type-check M1 source (inline text or a file path), returning diagnostics with code, severity and line/column. Pass a `Project.m1prj` to enable cross-script and reference-keyword checks and receive a project-load report. |
+| `m1_completeness` | Report how much of a project's source was analysed, typed and resolved, including opaque references, unmodelled intrinsics, skipped scripts and input-load state. Optional `filter` narrows the reported filenames. |
 | `m1_lint` | Lint M1 source with the project-configured `L0xx` rules. Findings include stable rule names and fixability. Optional fix mode returns verified fixed text without writing files. |
 | `m1_lint_rule` | Look up one exact `L0xx` code and return its severity, default state, fixability, summary, and full explanation. |
 | `m1_format` | Format M1 source to the M1 style, or (in `check_only` mode) just report whether it is already formatted. |
@@ -78,6 +79,21 @@ the partial result and lists every skipped path with its error. Treat a result
 with skipped inputs as partial, even when its diagnostics or CAN overlaps are
 otherwise empty.
 
+### Analysis completeness and firmware target
+
+Zero diagnostics does not prove that every expression or reference was
+understood. `m1_completeness` reports the silent surface directly: scripts
+analysed or skipped for syntax/depth, typed expressions, resolved/opaque/
+unresolved references, intrinsic calls missing from the catalogue, and
+incomplete `when` subjects. The percentages are telemetry, not a pass/fail
+gate. Its `load_report` identifies any project inputs omitted from the model.
+
+Doc-search, lookup, typecheck and completeness results include
+`catalogue_target`, naming the firmware/manual capture behind builtin signatures
+and enums. Those tools accept an optional `firmware` assertion. An unavailable
+target is rejected before analysis with an invalid-parameters error whose data
+lists `known_targets`; the server never silently substitutes another catalogue.
+
 The doc tools cover the toolchain's own **intrinsics catalogue** (the builtins
 M1 Build itself resolves against). They do **not** redistribute the proprietary
 MoTeC M1 Development Manual.
@@ -112,8 +128,8 @@ it is fixable, its one-line summary, and the linter's full explanation.
 
 `m1-mcp` is an **analysis and format bridge** — it lets an agent look up M1
 semantics and run the read-only analysers (`m1_doc_search`, `m1_doc_lookup`,
-`m1_typecheck`, `m1_lint`, `m1_lint_rule`, `m1_format`, `m1_symbols`, `m1_can`)
-over the code it writes.
+`m1_typecheck`, `m1_completeness`, `m1_lint`, `m1_lint_rule`, `m1_format`,
+`m1_symbols`, `m1_can`) over the code it writes.
 It is **not** full toolchain parity: it does not evaluate M1 scripts, does not
 mutate projects or write files back, and does not generate docs or
 visualisations. Use the individual CLIs (or the LSP/editor integrations) for
@@ -125,9 +141,9 @@ is bounded so no one call can monopolise it:
 - **Inline `source` and file reads** are capped at **2 MiB** per request; a
   larger payload (or a `path` to a larger file, rejected on its size before it
   is read) returns a structured error naming the limit.
-- **Project-wide operations** (`m1_typecheck` given a `project`, `m1_symbols`
-  and `m1_can`) walk at most **2000** `.m1scr` files; a larger project tree is
-  rejected before it is loaded.
+- **Project-wide operations** (`m1_typecheck` given a `project`,
+  `m1_completeness`, `m1_symbols` and `m1_can`) walk at most **2000** `.m1scr`
+  files; a larger project tree is rejected before it is loaded.
 
 The limits are compile-time constants (see `src/limits.rs`), sized well above
 any realistic interactive request — a project that hits them should be run
