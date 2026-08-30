@@ -121,5 +121,20 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Dependency updates
+
+The M1 libraries are pinned to release tags. Dependabot groups compatible
+updates to the other M1 crates, but it does not update `m1-typecheck` or
+`m1-can`. Its Cargo updater evaluates git-tag candidates one at a time before
+building a group, while these two releases are coupled: a new `m1-can` tag may
+require the matching `m1-typecheck` tag. During a release cascade, that has made
+Dependabot select an older tag and fail dependency resolution instead of
+opening a pull request.
+
+Update the `m1-typecheck` and `m1-can` tags together in `Cargo.toml` after both
+releases exist, refresh `Cargo.lock`, and run the build and test commands above.
+Dependabot remains a backstop for compatible updates to the rest of the M1
+toolchain.
+
 `m1-mcp` is part of the [M1 toolchain](https://github.com/C-Nucifora/m1-tools)
 and depends on its sibling crates via versioned git tags.
