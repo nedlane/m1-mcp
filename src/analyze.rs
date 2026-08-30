@@ -310,6 +310,9 @@ pub struct TypecheckOutcome {
     pub diagnostics: Vec<DiagnosticDto>,
     pub error_count: usize,
     pub warning_count: usize,
+    /// Firmware/manual target represented by the intrinsic catalogue used for
+    /// builtin signatures and enum membership.
+    pub catalogue_target: String,
     /// True when a `Project.m1prj` was loaded so cross-script/reference checks
     /// could run; false for a standalone snippet.
     pub project_loaded: bool,
@@ -449,6 +452,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         diagnostics,
         error_count,
         warning_count,
+        catalogue_target: m1_typecheck::intrinsics::active_target().to_string(),
         project_loaded,
         load_report,
     })
