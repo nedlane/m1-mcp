@@ -9,6 +9,15 @@ updates:
         patterns:
           - "tree-sitter-m1"
           - "m1-*"
+        exclude-patterns:
+          - "m1-typecheck"
+          - "m1-can"
+    ignore:
+      # These two tags are the coupled tail of the manual release cascade.
+      # Dependabot evaluates git-tag candidates independently before grouping
+      # them, which can select a stale tag and make Cargo's graph unresolvable.
+      - dependency-name: "m1-typecheck"
+      - dependency-name: "m1-can"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
