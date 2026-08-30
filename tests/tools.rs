@@ -200,6 +200,88 @@ fn typecheck_catches_cfg_typed_intrinsic_overload_mismatch() {
 }
 
 #[test]
+fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Related" TargetHardware="ecu120">
+  <ComponentStream>
+   <List>
+    <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
+    <Component Classname="BuiltIn.FuncUserParam" Filename="Helper.m1scr" Name="Root.Ctrl.Helper">
+     <Signature Name="" ReturnType="f32">
+      <Params><Param Name="Input" Type="f32" Attrs="0"/></Params>
+     </Signature>
+    </Component>
+    <Component Classname="BuiltIn.FuncUser" Filename="Caller.m1scr" Name="Root.Ctrl.Caller"/>
+   </List>
+  </ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+
+    let dbc_xml = |root: &str| {
+        format!(
+            r#"<?xml version="1.0"?>
+<DBC>
+ <ComponentStream>
+  <List>
+   <Component Classname="BuiltIn.CAN.DBC" Name="{root}"/>
+   <Component Classname="BuiltIn.CAN.Message" Name="{root}.Frame"><Props CANId="100" DLC="8"/></Component>
+   <Component Classname="BuiltIn.CAN.Signal" Name="{root}.Frame.Count"><Props Type="u32" StartBit="0" Length="10"/></Component>
+  </List>
+ </ComponentStream>
+</DBC>
+"#
+        )
+    };
+    let dbc_a = dir.path().join("BusA.m1dbc");
+    let dbc_b = dir.path().join("BusB.m1dbc");
+    std::fs::write(&dbc_a, dbc_xml("BusA")).unwrap();
+    std::fs::write(&dbc_b, dbc_xml("BusB")).unwrap();
+
+    let caller = dir.path().join("Caller.m1scr");
+    std::fs::write(
+        &caller,
+        "BusB.Frame.Count = 1.5;\nlocal result = Helper();\n",
+    )
+    .unwrap();
+
+    let out = analyze::typecheck(&Input::Path(caller), Some(&project)).expect("typecheck runs");
+    let assignment = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic.code == "T030"
+                && diagnostic.message.contains("Unsigned")
+                && diagnostic
+                    .related
+                    .iter()
+                    .any(|related| related.message.contains("BusB.Frame.Count"))
+        })
+        .unwrap_or_else(|| panic!("DBC assignment should produce T030: {out:?}"));
+    assert_eq!(assignment.related.len(), 1);
+    assert_eq!(assignment.related[0].path, dbc_b.display().to_string());
+
+    let arity = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T085")
+        .unwrap_or_else(|| panic!("bad Helper call should produce T085: {out:?}"));
+    assert_eq!(arity.related.len(), 1);
+    assert_eq!(arity.related[0].path, project.display().to_string());
+    assert_ne!(
+        arity.related[0].path,
+        dir.path().join("Helper.m1scr").display().to_string()
+    );
+}
+
+#[test]
 fn typecheck_identifies_project_diagnostic_path_and_subject() {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("Project.m1prj");

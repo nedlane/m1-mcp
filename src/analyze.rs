@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use m1_core::{Diagnostic, Severity};
 use m1_typecheck::cross_script::{self, ChannelTaints};
-use m1_typecheck::diagnostics::{RelatedPlace, TypeDiagnostic};
+use m1_typecheck::diagnostics::{RelatedLocation, RelatedPlace, TypeDiagnostic};
+use m1_typecheck::project::Project;
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -123,6 +124,7 @@ fn type_to_dto(
     scope: DiagnosticScope,
     source: DiagnosticSourceDto,
     project_path: Option<&Path>,
+    project: Option<&Project>,
 ) -> Result<DiagnosticDto, String> {
     let mut dto = to_dto(diagnostic.code.as_str(), &diagnostic.inner, scope, source);
     dto.subject.clone_from(&diagnostic.subject);
@@ -131,20 +133,118 @@ fn type_to_dto(
         .iter()
         .map(|related| {
             let RelatedPlace::Project { line } = related.place;
-            let path = project_path.ok_or_else(|| {
-                format!(
-                    "{} diagnostic carries a project related location without a project path",
-                    diagnostic.code.as_str()
-                )
-            })?;
+            let path = resolve_related_path_v050(diagnostic, related, line, project_path, project)?;
             Ok(RelatedLocationDto {
-                path: path.display().to_string(),
+                path,
                 line: line + 1,
                 message: related.message.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(dto)
+}
+
+/// Resolve the file behind m1-typecheck's project-related location.
+///
+/// In m1-typecheck v0.50.0, `RelatedPlace::Project` carries only a line even
+/// though the declaration may live in `Project.m1prj` or a loaded `.m1dbc`.
+/// Current related-location producers include the defining symbol path (full
+/// or script-relative) in backticks, so resolve those complete tokens against
+/// the active symbol table
+/// and require one unambiguous defining file. This deliberately fails closed
+/// instead of sending an agent to a plausible but incorrect path. Remove this
+/// compatibility shim once upstream carries structured file identity.
+fn resolve_related_path_v050(
+    diagnostic: &TypeDiagnostic,
+    related: &RelatedLocation,
+    line: u32,
+    project_path: Option<&Path>,
+    project: Option<&Project>,
+) -> Result<String, String> {
+    let project_path = project_path.ok_or_else(|| {
+        format!(
+            "{} diagnostic carries a project related location without a project path",
+            diagnostic.code.as_str()
+        )
+    })?;
+    let project = project.ok_or_else(|| {
+        format!(
+            "{} diagnostic carries a project related location without a loaded project",
+            diagnostic.code.as_str()
+        )
+    })?;
+
+    let tokens: Vec<&str> = related.message.split('`').skip(1).step_by(2).collect();
+    let mut symbol_paths: Vec<String> = Vec::new();
+    for token in tokens {
+        if let Some(symbol) = project.symbols().get(token) {
+            symbol_paths.push(symbol.path.clone());
+            continue;
+        }
+
+        // A few producers render a path relative to the checked script's
+        // group (for example `Helper` for `Root.Ctrl.Helper`). Only pay for a
+        // suffix scan when the structured exact lookup fails.
+        let suffix = format!(".{token}");
+        symbol_paths.extend(
+            project
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path.ends_with(&suffix))
+                .map(|symbol| symbol.path.clone()),
+        );
+    }
+    symbol_paths.sort();
+    symbol_paths.dedup();
+
+    let mut paths: Vec<PathBuf> = symbol_paths
+        .iter()
+        // SymbolTable may retain superseded entries; `get` returns the active
+        // last-writer symbol used by type resolution.
+        .filter_map(|path| project.symbols().get(path))
+        .filter(|symbol| symbol.def_line == Some(line))
+        .map(|symbol| {
+            symbol
+                .filename
+                .as_deref()
+                .filter(|filename| {
+                    Path::new(filename)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("m1dbc"))
+                })
+                .map_or_else(
+                    || project_path.to_path_buf(),
+                    |filename| {
+                        project_path
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .join(filename)
+                    },
+                )
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    match paths.as_slice() {
+        [path] => Ok(path.display().to_string()),
+        [] => Err(format!(
+            "{} related location at project line {} does not identify a defining symbol",
+            diagnostic.code.as_str(),
+            line + 1
+        )),
+        _ => Err(format!(
+            "{} related location at project line {} resolves to multiple files: {}",
+            diagnostic.code.as_str(),
+            line + 1,
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Where the source to analyse comes from.
@@ -255,6 +355,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                         DiagnosticScope::Project,
                         source_dto(Some(pp)),
                         Some(pp),
+                        Some(&*p),
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -295,6 +396,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
                     DiagnosticScope::Source,
                     input_source.clone(),
                     project_path,
+                    project.as_ref(),
                 )
             })
             .collect::<Result<Vec<_>, String>>()?,
