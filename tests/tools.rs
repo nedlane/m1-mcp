@@ -208,6 +208,7 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
         r#"<?xml version="1.0"?>
 <MoTeCM1BuildSession>
  <Project Name="Related" TargetHardware="ecu120">
+  <DataTypes><Type Name="Switch State" Storage="enum" Default="Off"><Enum Name="Off" ContainerOrder="0"/><Enum Name="On" ContainerOrder="1"/></Type></DataTypes>
   <ComponentStream>
    <List>
     <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
@@ -217,10 +218,18 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
      </Signature>
     </Component>
     <Component Classname="BuiltIn.FuncUser" Filename="Caller.m1scr" Name="Root.Ctrl.Caller"/>
+    <Component Classname="BuiltIn.Parameter" Name="Root.Ctrl.SwitchMode.Value"><Props/></Component>
    </List>
   </ComponentStream>
  </Project>
 </MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("parameters.m1cfg"),
+        r#"<?xml version="1.0"?>
+<Configuration><Group Name=""><Parameter Name="Root.Ctrl.SwitchMode.Value"><Cell Type="enum"><![CDATA[On]]></Cell></Parameter></Group></Configuration>
 "#,
     )
     .unwrap();
@@ -231,6 +240,7 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
 <DBC>
  <ComponentStream>
   <List>
+
 
 
    <Component Classname="BuiltIn.CAN.DBC" Name="{root}"/>
@@ -250,7 +260,7 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
     let caller = dir.path().join("Caller.m1scr");
     std::fs::write(
         &caller,
-        "BusB.Frame.Count = 1.5;\nlocal result = Helper();\n",
+        "BusB.Frame.Count = 1.5;\nSwitchMode.Value = 3;\nlocal result = Helper();\n",
     )
     .unwrap();
     let helper = dir.path().join("Helper.m1scr");
@@ -271,6 +281,17 @@ fn typecheck_resolves_related_declarations_to_project_or_dbc_files() {
         .unwrap_or_else(|| panic!("DBC assignment should produce T030: {out:?}"));
     assert_eq!(assignment.related.len(), 1);
     assert_eq!(assignment.related[0].path, dbc_b.display().to_string());
+
+    let enum_assignment = out
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "T030" && diagnostic.message.contains("Switch State"))
+        .unwrap_or_else(|| panic!("enum assignment should produce T030: {out:?}"));
+    assert_eq!(enum_assignment.related.len(), 1);
+    assert_eq!(
+        enum_assignment.related[0].path,
+        project.display().to_string()
+    );
 
     let arity = out
         .diagnostics

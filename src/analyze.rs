@@ -174,21 +174,22 @@ fn resolve_related_path_v050(
         )
     })?;
 
-    // Producers may quote descriptive values first (T098 quotes the argument
-    // name), but every v0.50.0 producer puts the defining symbol last.
-    let token = related
-        .message
-        .split('`')
-        .skip(1)
-        .step_by(2)
-        .last()
-        .ok_or_else(|| {
-            format!(
-                "{} related location at project line {} does not name a defining symbol",
-                diagnostic.code.as_str(),
-                line + 1
-            )
-        })?;
+    let tokens: Vec<&str> = related.message.split('`').skip(1).step_by(2).collect();
+    // T098 quotes the descriptive argument name before the defining function.
+    // Other v0.50.0 producers put the defining symbol first; notably T030 may
+    // later quote an enum type in the rendered target type.
+    let token = match diagnostic.code.as_str() {
+        "T098" => tokens.last(),
+        _ => tokens.first(),
+    }
+    .copied()
+    .ok_or_else(|| {
+        format!(
+            "{} related location at project line {} does not name a defining symbol",
+            diagnostic.code.as_str(),
+            line + 1
+        )
+    })?;
     let mut symbol_paths: Vec<String> = Vec::new();
     if let Some(symbol) = project.symbols().get(token) {
         symbol_paths.push(symbol.path.clone());
