@@ -127,6 +127,41 @@ const VALID_DBC: &str = r#"<?xml version="1.0"?>
 </List></ComponentStream></DBC>
 "#;
 
+const PIPELINE_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Pipeline" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Foo"/>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Foo.Gain.Value"><Props/></Component>
+   <Component Classname="BuiltIn.Table" Name="Root.Foo.Map"><Props/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Foo.Speed">
+    <Props Qty="rad/s"><Locale><Default Unit="%"/></Locale></Props>
+   </Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Foo.Menu">
+    <Props Storage="Flash" Security="Tune"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Foo.Update.m1scr" Name="Root.Foo.Update">
+    <Props SelectedTrigger="Root.Events.On 100Hz"/>
+   </Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#;
+
+const PIPELINE_SOURCE: &str = concat!(
+    "local f = 1.5; if (f == 2.5) { }\n",
+    "local x = Calculate.Max(1, 2, 3);\n",
+);
+
+fn write_pipeline_project(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let project = dir.join("Project.m1prj");
+    let script = dir.join("Foo.Update.m1scr");
+    std::fs::write(&project, PIPELINE_PROJECT).unwrap();
+    std::fs::write(dir.join("parameters.m1cfg"), EMPTY_CONFIG).unwrap();
+    std::fs::write(&script, PIPELINE_SOURCE).unwrap();
+    (project, script)
+}
+
 fn write_minimal_project(dir: &std::path::Path) -> std::path::PathBuf {
     let project = dir.join("Project.m1prj");
     std::fs::write(&project, MINIMAL_PROJECT).unwrap();
@@ -145,6 +180,132 @@ fn typecheck_reports_no_error_count_for_reasonable_source() {
         .count();
     assert_eq!(out.error_count, errors);
     assert!(!out.project_loaded, "no project was supplied");
+}
+
+#[test]
+fn typecheck_runs_the_complete_upstream_project_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (project, script) = write_pipeline_project(dir.path());
+
+    let out = analyze::typecheck(&Input::Path(script), Some(&project)).expect("typecheck runs");
+    let codes = out
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect::<Vec<_>>();
+    for expected in ["T041", "T092", "T095", "T111"] {
+        assert!(codes.contains(&expected), "missing {expected}: {codes:?}");
+    }
+    assert!(
+        codes.contains(&"T002"),
+        "missing default source rule: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"T064"),
+        "T064 must remain opt-in: {codes:?}"
+    );
+}
+
+#[test]
+fn typecheck_discovers_select_and_filters_source_and_project_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (project, script) = write_pipeline_project(dir.path());
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        "[diagnostics]\nselect = [\"T064\"]\n",
+    )
+    .unwrap();
+
+    let out = analyze::typecheck(&Input::Path(script), Some(&project)).expect("typecheck runs");
+    assert_eq!(
+        out.diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["T064"]
+    );
+}
+
+#[test]
+fn typecheck_select_activates_opt_in_project_rule_t089() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Schedule" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Events"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 100Hz"/>
+   <Component Classname="BuiltIn.EventKernel" Name="Root.Events.On 500Hz"/>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Ctrl"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Ctrl.Slow.m1scr" Name="Root.Ctrl.Slow">
+    <Props SelectedTrigger="Parent.Events.On 100Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Ctrl.Fast.m1scr" Name="Root.Ctrl.Fast">
+    <Props SelectedTrigger="Parent.Events.On 500Hz"/>
+   </Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Ctrl.Slow Out"><Props Type="f32"/></Component>
+   <Component Classname="BuiltIn.Channel" Name="Root.Ctrl.Fast Out"><Props Type="f32"/></Component>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    let slow = dir.path().join("Ctrl.Slow.m1scr");
+    std::fs::write(&slow, "Slow Out = 1.0;\n").unwrap();
+    std::fs::write(
+        dir.path().join("Ctrl.Fast.m1scr"),
+        "Fast Out = Slow Out + 1.0;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        "[diagnostics]\nselect = [\"T089\"]\n",
+    )
+    .unwrap();
+
+    let out = analyze::typecheck(&Input::Path(slow), Some(&project)).expect("typecheck runs");
+    assert_eq!(out.diagnostics.len(), 1, "unexpected findings: {out:?}");
+    assert_eq!(out.diagnostics[0].code, "T089");
+    assert_eq!(out.diagnostics[0].scope, DiagnosticScope::Project);
+}
+
+#[test]
+fn typecheck_discovers_ignore_and_ignore_symbols_for_project_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (project, script) = write_pipeline_project(dir.path());
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        concat!(
+            "[diagnostics]\n",
+            "ignore = [\"T095\"]\n",
+            "ignore_symbols = [",
+            "\"T041:Root.Foo.Gain.Value\", ",
+            "\"T092:Root.Foo.Map\"",
+            "]\n",
+        ),
+    )
+    .unwrap();
+
+    let out = analyze::typecheck(&Input::Path(script), Some(&project)).expect("typecheck runs");
+    let codes = out
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect::<Vec<_>>();
+    for suppressed in ["T041", "T092", "T095"] {
+        assert!(
+            !codes.contains(&suppressed),
+            "unexpected {suppressed}: {codes:?}"
+        );
+    }
+    assert!(
+        codes.contains(&"T111"),
+        "unrelated finding missing: {codes:?}"
+    );
 }
 
 #[test]

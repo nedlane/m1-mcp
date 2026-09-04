@@ -7,13 +7,12 @@
 //! Windows-1252 bytes for non-ASCII characters). Line/column in the DTOs are
 //! **1-based**, matching the CLIs' human-facing output.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use m1_core::{Diagnostic, Severity};
 use m1_lint::diagnostic::LintCode;
-use m1_typecheck::cross_script::{self, ChannelTaints};
 use m1_typecheck::diagnostics::{RelatedPlace, TypeDiagnostic};
+use m1_typecheck::project_check::{self, ProjectCheckOptions, SourceInput};
 use schemars::JsonSchema;
 use serde::Serialize;
 
@@ -284,75 +283,33 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         None => None,
     };
 
-    // Whole-project context: solve the cross-script channel-taint graph, infer
-    // user-function return types, and run the project-wide passes — the same
-    // work the CLI does. A bare per-file check silently dropped cross-script
-    // T080/T081, inferred return types, and the T088–T107 project audits, so a
-    // project the tool claims to check came back falsely clean.
-    let mut project_diags: Vec<DiagnosticDto> = Vec::new();
-    let channels = match (loaded.as_mut(), project_path) {
-        (Some(loaded), Some(pp)) => {
-            loaded.project.infer_return_types(&loaded.scripts);
-            let channels = cross_script::solve(&loaded.project, &loaded.scripts);
-
-            let mut pd: Vec<TypeDiagnostic> = Vec::new();
-            // Default-on passes, matching the CLI (T089 rate-inversion stays off).
-            pd.extend(m1_typecheck::schedule::check(
-                &loaded.project,
-                &loaded.scripts,
-                true,
-                false,
-                true,
-            ));
-            pd.extend(m1_typecheck::schedule::check_usage(
-                &loaded.project,
-                &loaded.scripts,
-                true,
-                true,
-            ));
-            pd.extend(m1_typecheck::schedule::check_multi_writers(
-                &loaded.project,
-                &loaded.scripts,
-            ));
-            pd.extend(m1_typecheck::schedule::check_cross_fn_assignment(
-                &loaded.project,
-                &loaded.scripts,
-            ));
-            pd.extend(m1_typecheck::schedule::check_reachability(
-                &loaded.project,
-                &loaded.scripts,
-            ));
-            pd.extend(m1_typecheck::dbc_init::check(
-                &loaded.project,
-                &loaded.scripts,
-            ));
-            project_diags = pd
-                .iter()
-                .map(|diagnostic| {
-                    type_to_dto(
-                        diagnostic,
-                        DiagnosticScope::Project,
-                        source_dto(Some(pp)),
-                        Some(pp),
-                    )
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-
-            channels
-        }
-        _ => ChannelTaints::default(),
+    // One upstream entry point owns the full pass list and diagnostics policy.
+    // Discover from the logical script directory first, then the project
+    // directory, matching the CLI while keeping inline context paths read-only.
+    let discovery_dir = resolved
+        .script_path
+        .and_then(Path::parent)
+        .or_else(|| project_path.and_then(Path::parent));
+    let options = ProjectCheckOptions::discover(discovery_dir);
+    let source_input = match resolved.script_path {
+        Some(path) => SourceInput::at_path(path, &resolved.source),
+        None => SourceInput::inline(&resolved.source),
     };
+    let result = match loaded.as_mut() {
+        Some(loaded) => project_check::check(
+            Some(&mut loaded.project),
+            &loaded.scripts,
+            &[source_input],
+            &options,
+        ),
+        None => project_check::check(None, &[], &[source_input], &options),
+    };
+    let source_result = result
+        .sources
+        .first()
+        .ok_or_else(|| "type-check pipeline returned no source result".to_string())?;
 
-    let enabled: HashSet<String> = HashSet::new();
-    let result = m1_typecheck::rules::check_script_with_channels(
-        &enabled,
-        loaded.as_ref().map(|loaded| &loaded.project),
-        resolved.script_path,
-        &resolved.source,
-        &channels,
-    );
-
-    let mut diagnostics: Vec<DiagnosticDto> = result
+    let mut diagnostics: Vec<DiagnosticDto> = source_result
         .syntax_errors
         .iter()
         .map(|diagnostic| {
@@ -365,7 +322,7 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
         })
         .collect();
     diagnostics.extend(
-        result
+        source_result
             .diagnostics
             .iter()
             .map(|diagnostic| {
@@ -378,7 +335,20 @@ pub fn typecheck(input: &Input, project_path: Option<&Path>) -> Result<Typecheck
             })
             .collect::<Result<Vec<_>, String>>()?,
     );
-    diagnostics.extend(project_diags);
+    diagnostics.extend(
+        result
+            .project_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                type_to_dto(
+                    diagnostic,
+                    DiagnosticScope::Project,
+                    source_dto(project_path),
+                    project_path,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
 
     let error_count = diagnostics.iter().filter(|d| d.severity == "error").count();
     let warning_count = diagnostics
