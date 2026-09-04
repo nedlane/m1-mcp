@@ -12,6 +12,7 @@ pub mod completeness;
 pub mod doc;
 pub mod limits;
 pub mod loader;
+pub mod project_check;
 pub mod server;
 pub mod symbols;
 

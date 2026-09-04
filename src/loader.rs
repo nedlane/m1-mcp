@@ -71,6 +71,9 @@ pub struct ProjectLoadReport {
 /// report that describes every loaded or skipped auxiliary input.
 pub struct LoadedProject {
     pub project: Project,
+    /// Full logical paths aligned one-for-one with `scripts`. Keeping paths in
+    /// the shared snapshot avoids lossy filename joins for whole-project tools.
+    pub script_paths: Vec<std::path::PathBuf>,
     pub scripts: Vec<ParsedScript>,
     pub report: ProjectLoadReport,
 }
@@ -92,6 +95,10 @@ pub fn check_project_script_budget(project_path: &Path) -> Result<(), String> {
         return Ok(());
     };
     let count = m1_workspace::find_scripts(root).len();
+    check_script_count(count)
+}
+
+fn check_script_count(count: usize) -> Result<(), String> {
     if count > limits::MAX_PROJECT_SCRIPTS {
         return Err(format!(
             "project has {count} .m1scr files, which exceeds the {} script per-request limit; \
@@ -132,6 +139,7 @@ pub fn load_project_full_with_inline(
     let Some(dir) = project_path.parent() else {
         return Ok(LoadedProject {
             project: p,
+            script_paths: Vec::new(),
             scripts: Vec::new(),
             report,
         });
@@ -171,9 +179,12 @@ pub fn load_project_full_with_inline(
     }
 
     let mut sources = Vec::new();
+    let mut script_paths = Vec::new();
     let inline_name = inline.and_then(|(path, _)| path.file_name()?.to_str());
     let mut replaced_inline = false;
-    for script in m1_workspace::find_scripts(dir) {
+    let discovered_scripts = m1_workspace::find_scripts(dir);
+    check_script_count(discovered_scripts.len())?;
+    for script in discovered_scripts {
         let Some(name) = script.file_name().and_then(|name| name.to_str()) else {
             report.skipped_scripts.push(SkippedInput {
                 path: path_string(&script),
@@ -189,21 +200,26 @@ pub fn load_project_full_with_inline(
             _ => m1_workspace::read_text(&script).map_err(|error| error.to_string()),
         };
         match source {
-            Ok(source) => sources.push((name.to_string(), source)),
+            Ok(source) => {
+                sources.push((name.to_string(), source));
+                script_paths.push(script);
+            }
             Err(error) => report.skipped_scripts.push(SkippedInput {
                 path: path_string(&script),
                 error,
             }),
         }
     }
-    if !replaced_inline && let (Some(name), Some((_, source))) = (inline_name, inline) {
+    if !replaced_inline && let (Some(name), Some((path, source))) = (inline_name, inline) {
         sources.push((name.to_string(), source.to_string()));
+        script_paths.push(path.to_path_buf());
     }
     let scripts = parsed::parse_all(&sources);
     report.script_count = scripts.len();
 
     Ok(LoadedProject {
         project: p,
+        script_paths,
         scripts,
         report,
     })

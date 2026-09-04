@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::analyze::{self, Input};
-use crate::{can, completeness, doc, symbols};
+use crate::{can, completeness, doc, project_check, symbols};
 
 /// Guidance surfaced to the agent on connect.
 const INSTRUCTIONS: &str = "\
@@ -23,9 +23,10 @@ run `m1_typecheck`, `m1_lint`, and `m1_format` (check_only) on it. Pass either i
 `source` or a file `path`. With inline source, `context_path` supplies the unsaved \
 buffer's logical script path for project resolution and config discovery without reading \
 that file. Give `project` (a Project.m1prj) to enable cross-script and reference-keyword \
-checks. Use `m1_completeness` before treating zero diagnostics as proof: it reports unknown \
-types, opaque references, unmodelled intrinsics, and skipped scripts. `m1_lint` can return \
-a safe fixed source without writing the file; use \
+checks. Use `m1_check_project` to run typecheck, lint, and format checks across every project \
+script in one bounded request. Use `m1_completeness` before treating zero diagnostics as proof: \
+it reports unknown types, opaque references, unmodelled intrinsics, and skipped scripts. \
+`m1_lint` can return a safe fixed source without writing the file; use \
 `m1_lint_rule` for the rationale and fix behavior of an exact L-code. `m1_symbols` lists a \
 project's channels/parameters/functions.
 CAN: never judge CAN traffic from the `.m1dbc` files alone — a DBC carries no bus until a script \
@@ -206,6 +207,25 @@ pub struct CompletenessParams {
     pub firmware: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectCheckParams {
+    /// Path to a `Project.m1prj`.
+    pub project: String,
+    /// Checks to run. Omit to run typecheck, lint, and format.
+    #[serde(default)]
+    pub checks: Option<Vec<project_check::CheckKind>>,
+    /// Optional case-insensitive substring matched against script paths.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Maximum diagnostic records returned for each file (default 100, capped
+    /// at 1000 and also subject to the whole-response hard limit).
+    #[serde(default)]
+    pub per_file_diagnostic_limit: Option<usize>,
+    /// Optional firmware/manual catalogue target.
+    #[serde(default)]
+    pub firmware: Option<String>,
+}
+
 /// The M1 toolchain MCP server.
 #[derive(Debug, Clone, Default)]
 pub struct M1Server;
@@ -257,6 +277,34 @@ impl M1Server {
         analyze::typecheck(&input, project.as_deref())
             .map(Json)
             .map_err(|e| ErrorData::invalid_params(e, None))
+    }
+
+    /// Validate all selected scripts in a project in one bounded request.
+    #[tool(
+        description = "Check every script in a Project.m1prj with any combination of typecheck, lint, and check-only format (default all). Returns per-file results, separate project diagnostics, aggregate totals, skipped inputs, explicit truncation state, and `catalogue_target`. Optional `firmware` asserts the expected target; `filter` is a case-insensitive path substring; `per_file_diagnostic_limit` defaults to 100.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn m1_check_project(
+        &self,
+        Parameters(p): Parameters<ProjectCheckParams>,
+    ) -> Result<Json<project_check::ProjectCheckOutcome>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
+        let mut options = project_check::ProjectCheckOptions::default();
+        if let Some(checks) = p.checks {
+            options.checks = checks;
+        }
+        options.filter = p.filter;
+        if let Some(limit) = p.per_file_diagnostic_limit {
+            options.per_file_diagnostic_limit = limit;
+        }
+        project_check::check_project(&PathBuf::from(&p.project), &options)
+            .map(Json)
+            .map_err(|error| ErrorData::invalid_params(error, None))
     }
 
     /// Report how much of a project's source the analyser could type and
@@ -408,6 +456,43 @@ mod tests {
                 "{name} input schema missing {expected_input}"
             );
         }
+    }
+
+    #[test]
+    fn project_check_publishes_bounded_read_only_schema() {
+        let tools = M1Server::tool_router().list_all();
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "m1_check_project")
+            .expect("project check tool");
+        assert_eq!(
+            tool.input_schema.get("type"),
+            Some(&serde_json::json!("object"))
+        );
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("input properties");
+        for property in [
+            "project",
+            "checks",
+            "filter",
+            "per_file_diagnostic_limit",
+            "firmware",
+        ] {
+            assert!(properties.contains_key(property), "missing {property}");
+        }
+        assert_eq!(
+            tool.output_schema.as_ref().expect("output schema")["type"],
+            "object"
+        );
+        let annotations = tool.annotations.as_ref().expect("annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert!(
+            tool.output_schema.as_ref().expect("output schema")["properties"]
+                .as_object()
+                .is_some_and(|properties| properties.contains_key("catalogue_target"))
+        );
     }
 
     #[test]

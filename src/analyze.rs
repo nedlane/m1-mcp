@@ -95,7 +95,7 @@ fn source_dto(path: Option<&Path>) -> DiagnosticSourceDto {
     }
 }
 
-fn to_dto(
+pub(crate) fn to_dto(
     code: &str,
     d: &Diagnostic,
     scope: DiagnosticScope,
@@ -118,7 +118,7 @@ fn to_dto(
     }
 }
 
-fn type_to_dto(
+pub(crate) fn type_to_dto(
     diagnostic: &TypeDiagnostic,
     scope: DiagnosticScope,
     source: DiagnosticSourceDto,
@@ -508,13 +508,43 @@ pub fn lint(input: &Input, fix: bool) -> Result<LintOutcome, String> {
     }
 
     let resolved = input.resolve()?;
+    lint_resolved(&resolved, &config, fix)
+}
+
+/// Lint source already owned by a project snapshot. The project loader has
+/// applied its tree/file bounds, so this path deliberately does not reapply
+/// the smaller direct-request cap or reread the file.
+pub(crate) fn lint_loaded(path: &Path, source: &str, fix: bool) -> Result<LintOutcome, String> {
+    let config = lint_config(Some(path))?;
+    if config.is_excluded(path) {
+        return Ok(LintOutcome {
+            diagnostics: Vec::new(),
+            error_count: 0,
+            warning_count: 0,
+            excluded: true,
+            fix: fix.then_some(LintFixOutcome::Unchanged),
+        });
+    }
+    let resolved = ResolvedInput {
+        source: source.to_string(),
+        script_path: Some(path),
+        inline: false,
+    };
+    lint_resolved(&resolved, &config, fix)
+}
+
+fn lint_resolved(
+    resolved: &ResolvedInput<'_>,
+    config: &m1_lint::config::Config,
+    fix: bool,
+) -> Result<LintOutcome, String> {
     let input_source = if resolved.inline {
         DiagnosticSourceDto::Inline
     } else {
         source_dto(resolved.script_path)
     };
 
-    let registry = m1_lint::registry::Registry::from_config(&config);
+    let registry = m1_lint::registry::Registry::from_config(config);
     let runner = m1_lint::runner::Runner::new(registry);
     let run = runner.run_source(&resolved.source);
 
@@ -680,14 +710,30 @@ pub struct FormatOutcome {
 /// (`changed == false`).
 pub fn format(input: &Input, check_only: bool) -> Result<FormatOutcome, String> {
     let resolved = input.resolve()?;
+    format_resolved(&resolved.source, resolved.script_path, check_only)
+}
 
-    let opts = resolved
-        .script_path
+/// Format source already owned by a project snapshot without rereading it or
+/// applying the smaller cap used for direct MCP inputs.
+pub(crate) fn format_loaded(
+    path: &Path,
+    source: &str,
+    check_only: bool,
+) -> Result<FormatOutcome, String> {
+    format_resolved(source, Some(path), check_only)
+}
+
+fn format_resolved(
+    source: &str,
+    script_path: Option<&Path>,
+    check_only: bool,
+) -> Result<FormatOutcome, String> {
+    let opts = script_path
         .and_then(Path::parent)
         .map(resolve_format_options);
     let result = match &opts {
-        Some(o) => m1_fmt::format_str_with(&resolved.source, o),
-        None => m1_fmt::format_str(&resolved.source),
+        Some(o) => m1_fmt::format_str_with(source, o),
+        None => m1_fmt::format_str(source),
     }
     .map_err(|e| format!("format failed: {e}"))?;
     let warnings = result
@@ -713,7 +759,8 @@ pub fn format(input: &Input, check_only: bool) -> Result<FormatOutcome, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::{LintFixOutcome, lint_fix_outcome};
+    use super::{Input, LintFixOutcome, format_loaded, lint, lint_fix_outcome, lint_loaded};
+    use crate::limits;
 
     #[test]
     fn rejected_linter_fix_maps_to_unsafe_outcome() {
@@ -723,5 +770,27 @@ mod tests {
                 error: "fix would change program semantics".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn loaded_project_source_does_not_reapply_the_direct_request_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Large.m1scr");
+        let source = format!(
+            "//{}",
+            "x".repeat(limits::MAX_REQUEST_SOURCE_BYTES as usize)
+        );
+        let input = Input::Inline {
+            source: source.clone(),
+            context_path: Some(path.clone()),
+        };
+        assert!(
+            lint(&input, false)
+                .unwrap_err()
+                .contains("per-request limit")
+        );
+
+        lint_loaded(&path, &source, false).expect("loaded source lints");
+        format_loaded(&path, &source, true).expect("loaded source formats");
     }
 }
