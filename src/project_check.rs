@@ -304,16 +304,8 @@ pub fn check_project(
         .filter(|file| file.error.is_none())
         .zip(&readable)
     {
-        let input = analyze::Input::Inline {
-            source: source.source.clone(),
-            context_path: Some(source.path.clone()),
-        };
         if selected.contains(&CheckKind::Lint) {
-            let mut lint = analyze::lint(&input, false)?;
-            let source_dto = diagnostic_source(&source.path);
-            for diagnostic in &mut lint.diagnostics {
-                diagnostic.diagnostic.source = source_dto.clone();
-            }
+            let mut lint = analyze::lint_loaded(&source.path, &source.source, false)?;
             totals.errors += lint.error_count;
             totals.warnings += lint.warning_count;
             totals.lint_findings += lint.diagnostics.len();
@@ -334,7 +326,7 @@ pub fn check_project(
             });
         }
         if selected.contains(&CheckKind::Format) {
-            let mut format = analyze::format(&input, true)?;
+            let mut format = analyze::format_loaded(&source.path, &source.source, true)?;
             totals.files_needing_format += usize::from(format.changed);
             let retained = file
                 .typecheck
