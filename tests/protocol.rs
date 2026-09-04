@@ -208,6 +208,7 @@ fn stdio_protocol_exposes_tools_errors_and_clean_shutdown() {
     );
     for tool in tools {
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+        assert_eq!(tool["outputSchema"]["type"], "object", "{tool}");
     }
 
     let docs = structured(&client.call(3, "m1_doc_search", json!({"query": "Absolute"})));
@@ -295,7 +296,9 @@ fn optional_corpus_smoke_is_read_only_across_project_tools() {
         eprintln!("M1_CORPUS_PATH not set; skipping read-only MCP corpus smoke test");
         return;
     };
-    let project = find_project(&corpus)
+    let project = std::env::var_os("M1_PROJECT")
+        .map(PathBuf::from)
+        .or_else(|| find_project(&corpus))
         .unwrap_or_else(|| panic!("no Project.m1prj above {}", corpus.display()));
     let root = project.parent().expect("project directory");
     let source = m1_workspace::find_scripts(&corpus)
