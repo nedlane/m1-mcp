@@ -1,6 +1,6 @@
 //! Whole-project validation with bounded, per-file results.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use m1_typecheck::project_check::{self as upstream, SourceInput};
@@ -137,7 +137,15 @@ pub fn check_project(
         return Err("`checks` must contain at least one of typecheck, lint, or format".to_string());
     }
     loader::check_project_script_budget(project_path)?;
-    let mut loaded = loader::load_project_full(project_path)?;
+    let loaded = loader::load_project_full(project_path)?;
+    check_loaded_project(project_path, options, loaded)
+}
+
+fn check_loaded_project(
+    project_path: &Path,
+    options: &ProjectCheckOptions,
+    mut loaded: loader::LoadedProject,
+) -> Result<ProjectCheckOutcome, String> {
     let project_dir = project_path
         .parent()
         .ok_or_else(|| "project path has no parent directory".to_string())?;
@@ -149,37 +157,35 @@ pub fn check_project(
     let mut global_budget = limits::MAX_PROJECT_RESPONSE_DIAGNOSTICS;
     let mut diagnostics_truncated = false;
 
-    let sources_by_path: HashMap<_, _> = loaded
+    let mut snapshot = loaded
         .script_paths
         .iter()
         .zip(&loaded.scripts)
-        .map(|(path, script)| (path.as_path(), script.cst.source()))
-        .collect();
-    let skipped_by_path: HashMap<_, _> = loaded
-        .report
-        .skipped_scripts
-        .iter()
-        .map(|script| (script.path.as_str(), script.error.as_str()))
-        .collect();
-    let paths = m1_workspace::find_scripts(project_dir)
-        .into_iter()
-        .filter(|path| {
-            filter
-                .as_ref()
-                .is_none_or(|needle| path.to_string_lossy().to_lowercase().contains(needle))
-        })
+        .map(|(path, script)| (path.clone(), Some(script.cst.source().to_string()), None))
         .collect::<Vec<_>>();
+    snapshot.extend(loaded.report.skipped_scripts.iter().map(|script| {
+        (
+            PathBuf::from(&script.path),
+            None,
+            Some(script.error.clone()),
+        )
+    }));
+    snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshot.retain(|(path, _, _)| {
+        filter
+            .as_ref()
+            .is_none_or(|needle| path.to_string_lossy().to_lowercase().contains(needle))
+    });
 
     let mut readable = Vec::new();
-    let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
+    let mut files = Vec::with_capacity(snapshot.len());
+    for (path, source, error) in snapshot {
         let path_text = path.to_string_lossy().into_owned();
-        let source = sources_by_path.get(path.as_path()).copied();
         match source {
             Some(source) => {
                 readable.push(ReadableFile {
                     path: path.clone(),
-                    source: source.to_string(),
+                    source,
                 });
                 files.push(ProjectFileResult {
                     path: path_text,
@@ -191,13 +197,7 @@ pub fn check_project(
                 });
             }
             None => files.push(ProjectFileResult {
-                error: Some(
-                    skipped_by_path
-                        .get(path_text.as_str())
-                        .copied()
-                        .unwrap_or("script was not present in the loaded project snapshot")
-                        .to_string(),
-                ),
+                error,
                 path: path_text,
                 typecheck: None,
                 lint: None,
@@ -328,6 +328,7 @@ pub fn check_project(
         if selected.contains(&CheckKind::Format) {
             let mut format = analyze::format_loaded(&source.path, &source.source, true)?;
             totals.files_needing_format += usize::from(format.changed);
+            totals.warnings += format.warnings.len();
             let retained = file
                 .typecheck
                 .as_ref()
@@ -352,4 +353,82 @@ pub fn check_project(
         diagnostics_truncated,
         load_report: loaded.report,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL_PROJECT: &str = r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Snapshot" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Test"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#;
+
+    fn project_in(dir: &Path) -> PathBuf {
+        let project = dir.join("Project.m1prj");
+        std::fs::write(&project, MINIMAL_PROJECT).unwrap();
+        project
+    }
+
+    #[test]
+    fn loaded_snapshot_is_stable_when_directory_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        let original = dir.path().join("Original.m1scr");
+        let added = dir.path().join("Added.m1scr");
+        std::fs::write(&original, "local value = 1;\n").unwrap();
+        let loaded = loader::load_project_full(&project).unwrap();
+
+        std::fs::remove_file(&original).unwrap();
+        std::fs::write(&added, "local value = 2;\n").unwrap();
+        let outcome = check_loaded_project(
+            &project,
+            &ProjectCheckOptions {
+                checks: vec![CheckKind::Lint],
+                ..ProjectCheckOptions::default()
+            },
+            loaded,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.files.len(), 1);
+        assert_eq!(outcome.files[0].path, original.display().to_string());
+        assert!(outcome.files[0].error.is_none());
+        assert!(outcome.files[0].lint.is_some());
+        assert!(
+            !outcome
+                .files
+                .iter()
+                .any(|file| file.path == added.display().to_string())
+        );
+    }
+
+    #[test]
+    fn format_warnings_contribute_to_aggregate_warning_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_in(dir.path());
+        std::fs::write(
+            dir.path().join("Long.m1scr"),
+            format!("// {}\n", "unbreakable".repeat(20)),
+        )
+        .unwrap();
+
+        let outcome = check_project(
+            &project,
+            &ProjectCheckOptions {
+                checks: vec![CheckKind::Format],
+                ..ProjectCheckOptions::default()
+            },
+        )
+        .unwrap();
+        let format = outcome.files[0].format.as_ref().unwrap();
+
+        assert!(!format.warnings.is_empty());
+        assert_eq!(outcome.totals.warnings, format.warnings.len());
+    }
 }
