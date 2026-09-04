@@ -221,6 +221,9 @@ pub struct ProjectCheckParams {
     /// at 1000 and also subject to the whole-response hard limit).
     #[serde(default)]
     pub per_file_diagnostic_limit: Option<usize>,
+    /// Optional firmware/manual catalogue target.
+    #[serde(default)]
+    pub firmware: Option<String>,
 }
 
 /// The M1 toolchain MCP server.
@@ -278,7 +281,7 @@ impl M1Server {
 
     /// Validate all selected scripts in a project in one bounded request.
     #[tool(
-        description = "Check every script in a Project.m1prj with any combination of typecheck, lint, and check-only format (default all). Returns per-file results, separate project diagnostics, aggregate totals, skipped inputs, and explicit truncation state. Optional `filter` is a case-insensitive path substring; `per_file_diagnostic_limit` defaults to 100.",
+        description = "Check every script in a Project.m1prj with any combination of typecheck, lint, and check-only format (default all). Returns per-file results, separate project diagnostics, aggregate totals, skipped inputs, explicit truncation state, and `catalogue_target`. Optional `firmware` asserts the expected target; `filter` is a case-insensitive path substring; `per_file_diagnostic_limit` defaults to 100.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -290,6 +293,7 @@ impl M1Server {
         &self,
         Parameters(p): Parameters<ProjectCheckParams>,
     ) -> Result<Json<project_check::ProjectCheckOutcome>, ErrorData> {
+        validate_firmware(p.firmware.as_deref())?;
         let mut options = project_check::ProjectCheckOptions::default();
         if let Some(checks) = p.checks {
             options.checks = checks;
@@ -468,7 +472,13 @@ mod tests {
         let properties = tool.input_schema["properties"]
             .as_object()
             .expect("input properties");
-        for property in ["project", "checks", "filter", "per_file_diagnostic_limit"] {
+        for property in [
+            "project",
+            "checks",
+            "filter",
+            "per_file_diagnostic_limit",
+            "firmware",
+        ] {
             assert!(properties.contains_key(property), "missing {property}");
         }
         assert_eq!(
@@ -478,6 +488,11 @@ mod tests {
         let annotations = tool.annotations.as_ref().expect("annotations");
         assert_eq!(annotations.read_only_hint, Some(true));
         assert_eq!(annotations.destructive_hint, Some(false));
+        assert!(
+            tool.output_schema.as_ref().expect("output schema")["properties"]
+                .as_object()
+                .is_some_and(|properties| properties.contains_key("catalogue_target"))
+        );
     }
 
     #[test]

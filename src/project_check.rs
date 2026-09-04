@@ -104,6 +104,9 @@ pub struct ProjectCheckOutcome {
     pub project_diagnostics: Vec<DiagnosticDto>,
     pub totals: ProjectCheckTotals,
     pub diagnostics_truncated: bool,
+    /// Firmware/manual target represented by the intrinsic catalogue used for
+    /// builtin signatures and enum membership.
+    pub catalogue_target: String,
     pub load_report: loader::ProjectLoadReport,
 }
 
@@ -351,6 +354,7 @@ fn check_loaded_project(
         project_diagnostics,
         totals,
         diagnostics_truncated,
+        catalogue_target: m1_typecheck::intrinsics::active_target().to_string(),
         load_report: loaded.report,
     })
 }
@@ -430,5 +434,9 @@ mod tests {
 
         assert!(!format.warnings.is_empty());
         assert_eq!(outcome.totals.warnings, format.warnings.len());
+        assert_eq!(
+            outcome.catalogue_target,
+            m1_typecheck::intrinsics::active_target()
+        );
     }
 }
