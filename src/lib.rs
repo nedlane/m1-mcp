@@ -8,6 +8,7 @@
 
 pub mod analyze;
 pub mod can;
+pub mod completeness;
 pub mod doc;
 pub mod limits;
 pub mod loader;

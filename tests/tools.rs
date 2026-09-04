@@ -4,7 +4,7 @@
 
 use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input, LintFixOutcome};
 use m1_mcp::doc::{self, DocKind};
-use m1_mcp::{can, limits, loader, symbols};
+use m1_mcp::{can, completeness, limits, loader, symbols};
 
 // ---- doc reference --------------------------------------------------------
 
@@ -64,6 +64,21 @@ fn doc_lookup_expands_enum_members() {
             en.name
         );
     }
+}
+
+#[test]
+fn doc_and_typecheck_results_name_the_catalogue_target() {
+    let docs: doc::DocResults = doc::search("Absolute", 1).into();
+    assert_eq!(
+        docs.catalogue_target,
+        m1_typecheck::intrinsics::active_target()
+    );
+
+    let checked = analyze::typecheck(&inline("local x = 1;\n"), None).expect("typecheck runs");
+    assert_eq!(
+        checked.catalogue_target,
+        m1_typecheck::intrinsics::active_target()
+    );
 }
 
 // ---- analysers ------------------------------------------------------------
@@ -1067,6 +1082,104 @@ fn can_result_names_a_syntax_error_script_omitted_from_bus_bindings() {
         .find(|module| module.name == "Good")
         .expect("DBC module remains visible");
     assert!(!module.initialised, "unsafe Init calls must not bind a bus");
+}
+
+#[test]
+fn completeness_reports_fully_typed_and_opaque_scripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    let config = dir.path().join("parameters.m1cfg");
+    let dbc = dir.path().join("model.m1dbc");
+    std::fs::write(&config, EMPTY_CONFIG).unwrap();
+    std::fs::write(&dbc, VALID_DBC).unwrap();
+    std::fs::write(dir.path().join("Complete.m1scr"), "local x = 1 + 2;\n").unwrap();
+    std::fs::write(
+        dir.path().join("Opaque.m1scr"),
+        "local x = Engine.Speed + 1;\n",
+    )
+    .unwrap();
+
+    let complete = completeness::analyze_project(&project, Some("complete"))
+        .expect("complete script is analysed");
+    assert_eq!(complete.scripts_total, 1);
+    assert_eq!(complete.scripts_analysed, 1);
+    assert_eq!(complete.scripts_with_syntax_errors, 0);
+    assert_eq!(complete.scripts_skipped_deep, 0);
+    assert!(complete.expressions_total > 0);
+    assert_eq!(complete.expressions_typed, complete.expressions_total);
+    assert_eq!(complete.typed_percent, 100.0);
+    assert!(complete.cfg_loaded);
+    assert!(complete.dbc_loaded);
+    assert_eq!(complete.load_report.script_count, 2);
+    assert_eq!(
+        complete.catalogue_target,
+        m1_typecheck::intrinsics::active_target()
+    );
+    let json = serde_json::to_value(&complete).unwrap();
+    for field in [
+        "scripts_total",
+        "scripts_analysed",
+        "scripts_with_syntax_errors",
+        "scripts_skipped_deep",
+        "expressions_total",
+        "expressions_typed",
+        "typed_percent",
+        "references_total",
+        "references_resolved",
+        "references_opaque",
+        "references_unresolved",
+        "resolved_percent",
+        "intrinsic_calls_total",
+        "intrinsic_calls_unmodelled",
+        "when_subjects_total",
+        "when_subjects_incomplete",
+        "cfg_loaded",
+        "dbc_loaded",
+        "catalogue_target",
+        "load_report",
+    ] {
+        assert!(
+            json.get(field).is_some(),
+            "missing completeness field {field}"
+        );
+    }
+    let schema =
+        serde_json::to_value(schemars::schema_for!(completeness::CompletenessOutcome)).unwrap();
+    assert_eq!(schema["type"], "object");
+
+    let opaque = completeness::analyze_project(&project, Some("OPAQUE"))
+        .expect("script filter is case-insensitive");
+    assert_eq!(opaque.scripts_total, 1);
+    assert!(opaque.references_total > 0);
+    assert!(opaque.references_opaque > 0);
+    assert!(opaque.expressions_typed < opaque.expressions_total);
+    assert!(opaque.typed_percent < 100.0);
+}
+
+#[test]
+fn completeness_distinguishes_syntax_and_depth_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    std::fs::write(dir.path().join("Broken.m1scr"), "local x = ;\n").unwrap();
+
+    let outcome =
+        completeness::analyze_project(&project, Some("Broken")).expect("report is telemetry");
+    assert_eq!(outcome.scripts_total, 1);
+    assert_eq!(outcome.scripts_analysed, 0);
+    assert_eq!(outcome.scripts_with_syntax_errors, 1);
+    assert_eq!(outcome.scripts_skipped_deep, 0);
+    assert_eq!(outcome.expressions_total, 0);
+
+    let depth = m1_core::MAX_RECURSION_DEPTH + 100;
+    let deep = format!("local x = {}1{};\n", "(".repeat(depth), ")".repeat(depth));
+    std::fs::write(dir.path().join("Deep.m1scr"), deep).unwrap();
+    let outcome = completeness::analyze_project(&project, Some("Deep"))
+        .expect("deep input is skipped, not fatal");
+    assert_eq!(outcome.scripts_total, 1);
+    assert_eq!(outcome.scripts_analysed, 0);
+    assert_eq!(outcome.scripts_with_syntax_errors, 0);
+    assert_eq!(outcome.scripts_skipped_deep, 1);
+    assert_eq!(outcome.expressions_total, 0);
 }
 
 #[test]
