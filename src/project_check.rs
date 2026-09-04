@@ -146,6 +146,8 @@ pub fn check_project(
     let per_file_limit = options
         .per_file_diagnostic_limit
         .min(MAX_PER_FILE_DIAGNOSTIC_LIMIT);
+    let mut global_budget = limits::MAX_PROJECT_RESPONSE_DIAGNOSTICS;
+    let mut diagnostics_truncated = false;
 
     let sources_by_path: HashMap<_, _> = loaded
         .script_paths
@@ -205,6 +207,11 @@ pub fn check_project(
         }
     }
 
+    let mut totals = ProjectCheckTotals {
+        files: files.len(),
+        files_checked: readable.len(),
+        ..ProjectCheckTotals::default()
+    };
     let mut project_diagnostics = Vec::new();
     if selected.contains(&CheckKind::Typecheck) {
         let inputs = readable
@@ -217,62 +224,79 @@ pub fn check_project(
             &inputs,
             &upstream::ProjectCheckOptions::discover(Some(project_dir)),
         );
+        for diagnostic in &result.project_diagnostics {
+            let diagnostic = analyze::type_to_dto(
+                diagnostic,
+                DiagnosticScope::Project,
+                diagnostic_source(project_path),
+                Some(project_path),
+            )?;
+            totals.errors += usize::from(diagnostic.severity == "error");
+            totals.warnings += usize::from(diagnostic.severity == "warning");
+            if global_budget > 0 {
+                project_diagnostics.push(diagnostic);
+                global_budget -= 1;
+                totals.diagnostics_returned += 1;
+            } else {
+                diagnostics_truncated = true;
+            }
+        }
         for (file, source_result) in files
             .iter_mut()
             .filter(|file| file.error.is_none())
             .zip(result.sources)
         {
             let source = diagnostic_source(Path::new(&file.path));
-            let mut diagnostics = source_result
-                .syntax_errors
-                .iter()
-                .map(|diagnostic| {
-                    analyze::to_dto(
-                        "syntax",
-                        diagnostic,
-                        DiagnosticScope::Source,
-                        source.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            diagnostics.extend(
-                source_result
-                    .diagnostics
-                    .iter()
-                    .map(|diagnostic| {
-                        analyze::type_to_dto(
-                            diagnostic,
-                            DiagnosticScope::Source,
-                            source.clone(),
-                            Some(project_path),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            );
+            let mut diagnostics = Vec::with_capacity(per_file_limit.min(global_budget));
+            let mut file_budget = per_file_limit;
+            let mut error_count = 0;
+            let mut warning_count = 0;
+            for diagnostic in &source_result.syntax_errors {
+                let diagnostic = analyze::to_dto(
+                    "syntax",
+                    diagnostic,
+                    DiagnosticScope::Source,
+                    source.clone(),
+                );
+                error_count += usize::from(diagnostic.severity == "error");
+                warning_count += usize::from(diagnostic.severity == "warning");
+                if file_budget > 0 && global_budget > 0 {
+                    diagnostics.push(diagnostic);
+                    file_budget -= 1;
+                    global_budget -= 1;
+                    totals.diagnostics_returned += 1;
+                } else {
+                    file.diagnostics_truncated = true;
+                    diagnostics_truncated = true;
+                }
+            }
+            for diagnostic in &source_result.diagnostics {
+                let diagnostic = analyze::type_to_dto(
+                    diagnostic,
+                    DiagnosticScope::Source,
+                    source.clone(),
+                    Some(project_path),
+                )?;
+                error_count += usize::from(diagnostic.severity == "error");
+                warning_count += usize::from(diagnostic.severity == "warning");
+                if file_budget > 0 && global_budget > 0 {
+                    diagnostics.push(diagnostic);
+                    file_budget -= 1;
+                    global_budget -= 1;
+                    totals.diagnostics_returned += 1;
+                } else {
+                    file.diagnostics_truncated = true;
+                    diagnostics_truncated = true;
+                }
+            }
+            totals.errors += error_count;
+            totals.warnings += warning_count;
             file.typecheck = Some(FileTypecheckResult {
-                error_count: diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.severity == "error")
-                    .count(),
-                warning_count: diagnostics
-                    .iter()
-                    .filter(|diagnostic| diagnostic.severity == "warning")
-                    .count(),
+                error_count,
+                warning_count,
                 diagnostics,
             });
         }
-        project_diagnostics = result
-            .project_diagnostics
-            .iter()
-            .map(|diagnostic| {
-                analyze::type_to_dto(
-                    diagnostic,
-                    DiagnosticScope::Project,
-                    diagnostic_source(project_path),
-                    Some(project_path),
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
     }
 
     for (file, source) in files
@@ -285,7 +309,23 @@ pub fn check_project(
             context_path: Some(source.path.clone()),
         };
         if selected.contains(&CheckKind::Lint) {
-            let lint = analyze::lint(&input, false)?;
+            let mut lint = analyze::lint(&input, false)?;
+            let source_dto = diagnostic_source(&source.path);
+            for diagnostic in &mut lint.diagnostics {
+                diagnostic.diagnostic.source = source_dto.clone();
+            }
+            totals.errors += lint.error_count;
+            totals.warnings += lint.warning_count;
+            totals.lint_findings += lint.diagnostics.len();
+            let mut file_budget = per_file_limit.saturating_sub(
+                file.typecheck
+                    .as_ref()
+                    .map_or(0, |typecheck| typecheck.diagnostics.len()),
+            );
+            file.diagnostics_truncated |=
+                retain_bounded(&mut lint.diagnostics, &mut file_budget, &mut global_budget);
+            totals.diagnostics_returned += lint.diagnostics.len();
+            diagnostics_truncated |= file.diagnostics_truncated;
             file.lint = Some(FileLintResult {
                 diagnostics: lint.diagnostics,
                 error_count: lint.error_count,
@@ -294,65 +334,23 @@ pub fn check_project(
             });
         }
         if selected.contains(&CheckKind::Format) {
-            let format = analyze::format(&input, true)?;
+            let mut format = analyze::format(&input, true)?;
+            totals.files_needing_format += usize::from(format.changed);
+            let retained = file
+                .typecheck
+                .as_ref()
+                .map_or(0, |typecheck| typecheck.diagnostics.len())
+                + file.lint.as_ref().map_or(0, |lint| lint.diagnostics.len());
+            let mut file_budget = per_file_limit.saturating_sub(retained);
+            file.diagnostics_truncated |=
+                retain_bounded(&mut format.warnings, &mut file_budget, &mut global_budget);
+            totals.diagnostics_returned += format.warnings.len();
+            diagnostics_truncated |= file.diagnostics_truncated;
             file.format = Some(FileFormatResult {
                 changed: format.changed,
                 warnings: format.warnings,
             });
         }
-    }
-
-    let mut totals = ProjectCheckTotals {
-        files: files.len(),
-        files_checked: readable.len(),
-        ..ProjectCheckTotals::default()
-    };
-    for diagnostic in &project_diagnostics {
-        totals.errors += usize::from(diagnostic.severity == "error");
-        totals.warnings += usize::from(diagnostic.severity == "warning");
-    }
-    for file in &files {
-        if let Some(typecheck) = &file.typecheck {
-            totals.errors += typecheck.error_count;
-            totals.warnings += typecheck.warning_count;
-        }
-        if let Some(lint) = &file.lint {
-            totals.errors += lint.error_count;
-            totals.warnings += lint.warning_count;
-            totals.lint_findings += lint.diagnostics.len();
-        }
-        totals.files_needing_format +=
-            usize::from(file.format.as_ref().is_some_and(|format| format.changed));
-    }
-
-    let mut global_budget = limits::MAX_PROJECT_RESPONSE_DIAGNOSTICS;
-    let mut diagnostics_truncated = false;
-    let project_keep = project_diagnostics.len().min(global_budget);
-    diagnostics_truncated |= project_keep < project_diagnostics.len();
-    project_diagnostics.truncate(project_keep);
-    global_budget -= project_keep;
-    totals.diagnostics_returned += project_keep;
-    for file in &mut files {
-        let mut file_budget = per_file_limit;
-        if let Some(typecheck) = &mut file.typecheck {
-            file.diagnostics_truncated |= retain_bounded(
-                &mut typecheck.diagnostics,
-                &mut file_budget,
-                &mut global_budget,
-            );
-            totals.diagnostics_returned += typecheck.diagnostics.len();
-        }
-        if let Some(lint) = &mut file.lint {
-            file.diagnostics_truncated |=
-                retain_bounded(&mut lint.diagnostics, &mut file_budget, &mut global_budget);
-            totals.diagnostics_returned += lint.diagnostics.len();
-        }
-        if let Some(format) = &mut file.format {
-            file.diagnostics_truncated |=
-                retain_bounded(&mut format.warnings, &mut file_budget, &mut global_budget);
-            totals.diagnostics_returned += format.warnings.len();
-        }
-        diagnostics_truncated |= file.diagnostics_truncated;
     }
 
     Ok(ProjectCheckOutcome {

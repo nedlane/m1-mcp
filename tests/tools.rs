@@ -679,6 +679,18 @@ fn project_check_reports_each_file_and_separates_project_findings() {
             .len(),
         1
     );
+    assert!(
+        filtered.files[0]
+            .lint
+            .as_ref()
+            .expect("lint selected")
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.source
+                == DiagnosticSourceDto::Path {
+                    path: style.display().to_string()
+                })
+    );
     assert!(filtered.files[0].format.is_some());
     assert!(filtered.files[0].diagnostics_truncated);
     assert!(filtered.diagnostics_truncated);
