@@ -95,6 +95,10 @@ pub fn check_project_script_budget(project_path: &Path) -> Result<(), String> {
         return Ok(());
     };
     let count = m1_workspace::find_scripts(root).len();
+    check_script_count(count)
+}
+
+fn check_script_count(count: usize) -> Result<(), String> {
     if count > limits::MAX_PROJECT_SCRIPTS {
         return Err(format!(
             "project has {count} .m1scr files, which exceeds the {} script per-request limit; \
@@ -178,7 +182,9 @@ pub fn load_project_full_with_inline(
     let mut script_paths = Vec::new();
     let inline_name = inline.and_then(|(path, _)| path.file_name()?.to_str());
     let mut replaced_inline = false;
-    for script in m1_workspace::find_scripts(dir) {
+    let discovered_scripts = m1_workspace::find_scripts(dir);
+    check_script_count(discovered_scripts.len())?;
+    for script in discovered_scripts {
         let Some(name) = script.file_name().and_then(|name| name.to_str()) else {
             report.skipped_scripts.push(SkippedInput {
                 path: path_string(&script),

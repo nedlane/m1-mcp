@@ -1143,8 +1143,7 @@ fn source_at_the_limit_is_accepted() {
 #[test]
 fn project_script_budget_rejects_huge_tree() {
     let dir = tempfile::tempdir().unwrap();
-    let proj = dir.path().join("Project.m1prj");
-    std::fs::write(&proj, "<Project/>").unwrap();
+    let proj = write_minimal_project(dir.path());
     for i in 0..(limits::MAX_PROJECT_SCRIPTS + 1) {
         std::fs::write(dir.path().join(format!("s{i}.m1scr")), "").unwrap();
     }
@@ -1153,6 +1152,13 @@ fn project_script_budget_rejects_huge_tree() {
     assert!(
         err.contains("exceeds") && err.contains("script"),
         "error should name the script limit: {err}"
+    );
+    let err = loader::load_project_full(&proj)
+        .err()
+        .expect("the authoritative loader walk must enforce the same cap");
+    assert!(
+        err.contains("exceeds") && err.contains("script"),
+        "loader error should name the script limit: {err}"
     );
 }
 
