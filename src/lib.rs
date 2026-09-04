@@ -7,6 +7,7 @@
 //! its own edits. See [`server::M1Server`] for the tool set.
 
 pub mod analyze;
+pub mod can;
 pub mod doc;
 pub mod limits;
 pub mod loader;
