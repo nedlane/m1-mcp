@@ -95,7 +95,7 @@ fn source_dto(path: Option<&Path>) -> DiagnosticSourceDto {
     }
 }
 
-fn to_dto(
+pub(crate) fn to_dto(
     code: &str,
     d: &Diagnostic,
     scope: DiagnosticScope,
@@ -118,7 +118,7 @@ fn to_dto(
     }
 }
 
-fn type_to_dto(
+pub(crate) fn type_to_dto(
     diagnostic: &TypeDiagnostic,
     scope: DiagnosticScope,
     source: DiagnosticSourceDto,

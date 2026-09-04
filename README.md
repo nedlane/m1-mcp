@@ -17,6 +17,7 @@ having the CLIs installed on your `PATH`.
 | `m1_doc_search` | Search the M1 builtin catalogue — library functions, project-object methods, firmware enumerations, package classes, data types — and get ranked matches with signatures and docs. |
 | `m1_doc_lookup` | Full detail for one exact builtin name: every overload of a function, all members of an enum, a class summary, or a data type. |
 | `m1_typecheck` | Type-check M1 source (inline text or a file path), returning diagnostics with code, severity and line/column. Pass a `Project.m1prj` to enable cross-script and reference-keyword checks and receive a project-load report. |
+| `m1_check_project` | Run typecheck, lint and check-only format across every project script in one bounded request, with per-file results, separate project findings and aggregate totals. |
 | `m1_completeness` | Report how much of a project's source was analysed, typed and resolved, including opaque references, unmodelled intrinsics, skipped scripts and input-load state. Optional `filter` narrows the reported filenames. |
 | `m1_lint` | Lint M1 source with the project-configured `L0xx` rules. Findings include stable rule names and fixability. Optional fix mode returns verified fixed text without writing files. |
 | `m1_lint_rule` | Look up one exact `L0xx` code and return its severity, default state, fixability, summary, and full explanation. |
@@ -128,8 +129,8 @@ it is fixable, its one-line summary, and the linter's full explanation.
 
 `m1-mcp` is an **analysis and format bridge** — it lets an agent look up M1
 semantics and run the read-only analysers (`m1_doc_search`, `m1_doc_lookup`,
-`m1_typecheck`, `m1_completeness`, `m1_lint`, `m1_lint_rule`, `m1_format`,
-`m1_symbols`, `m1_can`) over the code it writes.
+`m1_typecheck`, `m1_check_project`, `m1_completeness`, `m1_lint`,
+`m1_lint_rule`, `m1_format`, `m1_symbols`, `m1_can`) over the code it writes.
 It is **not** full toolchain parity: it does not evaluate M1 scripts, does not
 mutate projects or write files back, and does not generate docs or
 visualisations. Use the individual CLIs (or the LSP/editor integrations) for
@@ -142,8 +143,12 @@ is bounded so no one call can monopolise it:
   larger payload (or a `path` to a larger file, rejected on its size before it
   is read) returns a structured error naming the limit.
 - **Project-wide operations** (`m1_typecheck` given a `project`,
-  `m1_completeness`, `m1_symbols` and `m1_can`) walk at most **2000** `.m1scr`
-  files; a larger project tree is rejected before it is loaded.
+  `m1_check_project`, `m1_completeness`, `m1_symbols` and `m1_can`) walk at most
+  **2000** `.m1scr` files; a larger project tree is rejected before it is
+  loaded.
+- **Whole-project diagnostic responses** return at most **5000** diagnostic or
+  formatting-warning records. `m1_check_project` also defaults to 100 records
+  per file and reports whenever either bound truncates its response.
 
 The limits are compile-time constants (see `src/limits.rs`), sized well above
 any realistic interactive request — a project that hits them should be run

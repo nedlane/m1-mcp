@@ -29,3 +29,7 @@ pub const MAX_REQUEST_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 /// bounding the parse work one request can trigger against a pathological or
 /// unexpectedly large project tree.
 pub const MAX_PROJECT_SCRIPTS: usize = 2000;
+
+/// Hard ceiling on diagnostic and formatting-warning records returned by a
+/// whole-project check, regardless of its requested per-file limit.
+pub const MAX_PROJECT_RESPONSE_DIAGNOSTICS: usize = 5000;

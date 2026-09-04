@@ -4,7 +4,7 @@
 
 use m1_mcp::analyze::{self, DiagnosticScope, DiagnosticSourceDto, Input, LintFixOutcome};
 use m1_mcp::doc::{self, DocKind};
-use m1_mcp::{can, completeness, limits, loader, symbols};
+use m1_mcp::{can, completeness, limits, loader, project_check, symbols};
 
 // ---- doc reference --------------------------------------------------------
 
@@ -595,6 +595,97 @@ fn typecheck_identifies_project_diagnostic_path_and_subject() {
 }
 
 #[test]
+fn project_check_reports_each_file_and_separates_project_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("Project.m1prj");
+    std::fs::write(
+        &project,
+        r#"<?xml version="1.0"?>
+<MoTeCM1BuildSession>
+ <Project Name="Whole Project" TargetHardware="ecu120">
+  <ComponentStream><List>
+   <Component Classname="BuiltIn.GroupCompound" Name="Root.Test"/>
+   <Component Classname="BuiltIn.Parameter" Name="Root.Test.Missing.Value"><Props/></Component>
+   <Component Classname="BuiltIn.FuncUser" Filename="Test.Broken.m1scr" Name="Root.Test.Broken"/>
+   <Component Classname="BuiltIn.FuncUser" Filename="Test.Style.m1scr" Name="Root.Test.Style"/>
+  </List></ComponentStream>
+ </Project>
+</MoTeCM1BuildSession>
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("parameters.m1cfg"), EMPTY_CONFIG).unwrap();
+    let broken = dir.path().join("Test.Broken.m1scr");
+    let style = dir.path().join("Test.Style.m1scr");
+    std::fs::write(&broken, "if (\n").unwrap();
+    std::fs::write(&style, "local equal=A==B;\n").unwrap();
+
+    let out =
+        project_check::check_project(&project, &project_check::ProjectCheckOptions::default())
+            .expect("project check runs");
+
+    assert_eq!(out.totals.files, 2);
+    assert_eq!(out.files.len(), 2);
+    assert!(
+        out.files
+            .iter()
+            .any(|file| file.path == broken.display().to_string())
+    );
+    assert!(
+        out.files
+            .iter()
+            .any(|file| file.path == style.display().to_string())
+    );
+    assert!(
+        out.totals.errors > 0,
+        "source syntax error must count: {out:?}"
+    );
+    assert!(
+        out.totals.lint_findings > 0,
+        "lint finding must count: {out:?}"
+    );
+    assert!(
+        out.totals.files_needing_format > 0,
+        "format drift must count: {out:?}"
+    );
+    assert!(
+        out.project_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "T041"),
+        "project finding must be separate: {out:?}"
+    );
+    assert_eq!(out.load_report.project, project.display().to_string());
+
+    let filtered = project_check::check_project(
+        &project,
+        &project_check::ProjectCheckOptions {
+            checks: vec![
+                project_check::CheckKind::Lint,
+                project_check::CheckKind::Format,
+            ],
+            filter: Some("style".to_string()),
+            per_file_diagnostic_limit: 1,
+        },
+    )
+    .expect("filtered project check runs");
+    assert_eq!(filtered.files.len(), 1);
+    assert!(filtered.files[0].typecheck.is_none());
+    assert_eq!(
+        filtered.files[0]
+            .lint
+            .as_ref()
+            .expect("lint selected")
+            .diagnostics
+            .len(),
+        1
+    );
+    assert!(filtered.files[0].format.is_some());
+    assert!(filtered.files[0].diagnostics_truncated);
+    assert!(filtered.diagnostics_truncated);
+    assert!(filtered.project_diagnostics.is_empty());
+}
+
+#[test]
 fn inline_context_path_anchors_project_group_and_backing_function() {
     let dir = tempfile::tempdir().unwrap();
     let scripts_dir = dir.path().join("Scripts");
@@ -1147,6 +1238,24 @@ fn project_load_report_names_unreadable_scripts() {
             .error
             .contains("read limit")
     );
+
+    let checked =
+        project_check::check_project(&project, &project_check::ProjectCheckOptions::default())
+            .expect("project check keeps readable results");
+    assert_eq!(checked.files.len(), 2);
+    let skipped = checked
+        .files
+        .iter()
+        .find(|file| file.path == oversized.to_string_lossy())
+        .expect("skipped input remains associated with a file result");
+    assert!(
+        skipped
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("read limit"))
+    );
+    assert!(skipped.typecheck.is_none());
+    assert_eq!(checked.load_report.skipped_scripts.len(), 1);
 }
 
 #[test]
