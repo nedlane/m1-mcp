@@ -1039,6 +1039,37 @@ fn malformed_auxiliary_dbc_returns_partial_can_result_with_warning_details() {
 }
 
 #[test]
+fn can_result_names_a_syntax_error_script_omitted_from_bus_bindings() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_minimal_project(dir.path());
+    std::fs::write(dir.path().join("Good.m1dbc"), VALID_DBC).unwrap();
+    std::fs::write(
+        dir.path().join("CAN Init.m1scr"),
+        "DBC.Good.Init(1);\nlocal broken = ;\n",
+    )
+    .unwrap();
+
+    let inspected = can::inspect(&project, None, 200).expect("partial CAN result is returned");
+
+    assert_eq!(inspected.load_report.script_count, 1);
+    assert!(inspected.load_report.skipped_scripts.is_empty());
+    assert_eq!(inspected.can.skipped_scripts.len(), 1);
+    assert_eq!(inspected.can.skipped_scripts[0].script, "CAN Init.m1scr");
+    assert!(
+        inspected.can.skipped_scripts[0]
+            .reason
+            .contains("syntax diagnostic")
+    );
+    let module = inspected
+        .can
+        .modules
+        .iter()
+        .find(|module| module.name == "Good")
+        .expect("DBC module remains visible");
+    assert!(!module.initialised, "unsafe Init calls must not bind a bus");
+}
+
+#[test]
 fn typecheck_rejects_over_budget_project_before_loading() {
     // The budget guard fires before the project is loaded: the error is the
     // script-limit message, not a project-parse failure on the dummy .m1prj.
