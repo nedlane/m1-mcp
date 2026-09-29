@@ -530,7 +530,7 @@ dependencies = [
  "clap",
  "m1-core",
  "m1-typecheck",
- "m1-workspace",
+ "m1-workspace 0.13.0",
  "roxmltree",
  "schemars",
  "serde",
@@ -549,13 +549,13 @@ dependencies = [
 
 [[package]]
 name = "m1-fmt"
-version = "0.17.1"
-source = "git+https://github.com/C-Nucifora/m1-fmt.git?tag=v0.17.1#7f28c9f0a1452f3de6eee8278232346e7b1aafc6"
+version = "0.18.0"
+source = "git+https://github.com/C-Nucifora/m1-fmt.git?tag=v0.18.0#4b5388f46285dcbe7687d73fe2b08ef5e4d770a0"
 dependencies = [
  "clap",
  "libc",
  "m1-core",
- "m1-workspace",
+ "m1-workspace 0.14.0",
  "rayon",
  "toml",
 ]
@@ -568,7 +568,7 @@ dependencies = [
  "clap",
  "glob",
  "m1-core",
- "m1-workspace",
+ "m1-workspace 0.13.0",
  "rayon",
  "serde_json",
  "toml",
@@ -584,7 +584,7 @@ dependencies = [
  "m1-fmt",
  "m1-lint",
  "m1-typecheck",
- "m1-workspace",
+ "m1-workspace 0.13.0",
  "rmcp",
  "schemars",
  "serde",
@@ -602,7 +602,7 @@ source = "git+https://github.com/C-Nucifora/m1-typecheck.git?tag=v0.51.0#e79bd0e
 dependencies = [
  "clap",
  "m1-core",
- "m1-workspace",
+ "m1-workspace 0.13.0",
  "roxmltree",
  "serde",
  "serde_json",
@@ -613,6 +613,16 @@ dependencies = [
 name = "m1-workspace"
 version = "0.13.0"
 source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.13.0#cf1b5b862d255cc4ecb89a7b708016bd9a9f33db"
+dependencies = [
+ "serde",
+ "serde_ignored",
+ "toml",
+]
+
+[[package]]
+name = "m1-workspace"
+version = "0.14.0"
+source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.14.0#b9ca8691ff203fe5fc5f5d5fff57c09b9f0b08fe"
 dependencies = [
  "serde",
  "serde_ignored",
