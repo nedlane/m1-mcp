@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -415,10 +415,10 @@ impl M1Server {
 
 #[tool_handler]
 impl ServerHandler for M1Server {
-    fn get_info(&self) -> ServerInfo {
-        // ServerInfo (InitializeResult) is #[non_exhaustive]; build from default
+    fn get_info(&self) -> ServerConfig {
+        // ServerConfig (InitializeResult) is #[non_exhaustive]; build from default
         // and set the fields we care about.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info.name = "m1-mcp".to_string();
