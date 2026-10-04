@@ -599,87 +599,10 @@ pub fn lint_rule(code: &str) -> Result<LintRuleMetadata, String> {
     })
 }
 
-/// Resolve `FormatOptions` for a file in `dir` from the unified `m1-tools.toml`
-/// `[format]` section then the tool-specific `.m1fmt.toml`, so the server
-/// formats a project with the same settings as its CLI/CI (e.g. a
-/// `brace_style = "kr"` project is not reformatted to the default Allman its CI
-/// then rejects). Mirrors `m1-fmt`'s own `resolve_opts` config layering; a
-/// future toolchain bump can call the shared `m1_fmt::config::resolve_options`
-/// added in m1-fmt v0.17.0 instead of this local copy.
+/// Resolve the same formatter configuration and width limits as the CLI.
+/// The shared resolver layers defaults, `m1-tools.toml`, and `.m1fmt.toml`.
 fn resolve_format_options(dir: &Path) -> m1_fmt::FormatOptions {
-    let mut o = m1_fmt::FormatOptions::default();
-
-    // Layer 1: the unified m1-tools.toml [format] section.
-    if let Some(tc) = m1_workspace::config::M1ToolsConfig::discover(dir) {
-        let f = tc.format;
-        if let Some(n) = f.line_width {
-            o.line_width = n;
-        }
-        if let Some(n) = f.max_blank_lines {
-            o.max_blank_lines = n;
-        }
-        if let Some(n) = f.indent_width {
-            o.indent_width = n;
-        }
-        if let Some(s) = f
-            .indent_style
-            .as_deref()
-            .and_then(m1_fmt::config::parse_indent_style)
-        {
-            o.indent_style = s;
-        }
-        if let Some(s) = f
-            .brace_style
-            .as_deref()
-            .and_then(m1_fmt::config::parse_brace_style)
-        {
-            o.brace_style = s;
-        }
-        if let Some(n) = f.continuation_indent {
-            o.continuation_indent = n;
-        }
-        if let Some(b) = f.align_assignments {
-            o.align_assignments = b;
-        }
-        if let Some(b) = f.reflow_comments {
-            o.reflow_comments = b;
-        }
-        if let Some(b) = f.final_blank_line {
-            o.final_blank_line = b;
-        }
-    }
-
-    // Layer 2: the tool-specific .m1fmt.toml overrides the unified file.
-    if let Some(cfg) = m1_fmt::config::discover(dir) {
-        if let Some(n) = cfg.max_line_length {
-            o.line_width = n;
-        }
-        if let Some(n) = cfg.max_blank_lines {
-            o.max_blank_lines = n;
-        }
-        if let Some(n) = cfg.indent_width {
-            o.indent_width = n;
-        }
-        if let Some(s) = cfg.indent_style {
-            o.indent_style = s;
-        }
-        if let Some(s) = cfg.brace_style {
-            o.brace_style = s;
-        }
-        if let Some(n) = cfg.continuation_indent {
-            o.continuation_indent = n;
-        }
-        if let Some(b) = cfg.align_assignments {
-            o.align_assignments = b;
-        }
-        if let Some(b) = cfg.reflow_comments {
-            o.reflow_comments = b;
-        }
-        if let Some(b) = cfg.final_blank_line {
-            o.final_blank_line = b;
-        }
-    }
-    o
+    m1_fmt::config::resolve_options(dir)
 }
 
 /// A formatting warning (kept but non-fatal).

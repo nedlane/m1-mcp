@@ -1539,6 +1539,32 @@ fn format_reads_brace_style_from_project_config() {
 }
 
 #[test]
+fn format_condition_alignment_honors_config_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = dir.path().join("Scripts");
+    std::fs::create_dir(&scripts).unwrap();
+    let context = scripts.join("unsaved.m1scr");
+    let source = "if (A eq 1 and Longer neq 2) { X = 0; }\n";
+    std::fs::write(
+        dir.path().join("m1-tools.toml"),
+        "[format]\nalign_conditions = true\nline_width = 24\n",
+    )
+    .unwrap();
+    let format = || {
+        analyze::format(&inline_at(source, context.clone()), false)
+            .unwrap()
+            .formatted
+            .unwrap()
+    };
+    assert!(format().starts_with("if (\n"));
+    std::fs::write(dir.path().join(".m1fmt.toml"), "align_conditions = false\n").unwrap();
+    assert!(format().starts_with("if (A eq 1"));
+    std::fs::write(dir.path().join(".m1fmt.toml"), "align_conditions = true\n").unwrap();
+    assert!(format().starts_with("if (\n"));
+    assert!(!context.exists());
+}
+
+#[test]
 fn lint_discovers_project_config_from_inline_context_path() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".m1lint.toml"), "ignore = [\"L004\"]\n").unwrap();
