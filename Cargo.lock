@@ -584,7 +584,7 @@ dependencies = [
  "m1-fmt",
  "m1-lint",
  "m1-typecheck",
- "m1-workspace 0.13.0",
+ "m1-workspace 0.14.1",
  "rmcp",
  "schemars",
  "serde",
@@ -623,6 +623,16 @@ dependencies = [
 name = "m1-workspace"
 version = "0.14.0"
 source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.14.0#b9ca8691ff203fe5fc5f5d5fff57c09b9f0b08fe"
+dependencies = [
+ "serde",
+ "serde_ignored",
+ "toml",
+]
+
+[[package]]
+name = "m1-workspace"
+version = "0.14.1"
+source = "git+https://github.com/nedlane/m1-workspace.git?tag=v0.14.1#635e81a29fcb4b998af7c2097e8262c741f4f547"
 dependencies = [
  "serde",
  "serde_ignored",
