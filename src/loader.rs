@@ -6,7 +6,7 @@
 //! additionally layers in the discovered `parameters.m1cfg` and every `.m1dbc`;
 //! this module does the same so an agent gets the same model as the CLI.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use m1_typecheck::parsed::{self, ParsedScript};
 use m1_typecheck::project::Project;
@@ -80,6 +80,21 @@ pub struct LoadedProject {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn absolute_script_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 /// Bound the whole-project work a single request can trigger: error if the
@@ -181,6 +196,9 @@ pub fn load_project_full_with_inline(
     let mut sources = Vec::new();
     let mut script_paths = Vec::new();
     let inline_name = inline.and_then(|(path, _)| path.file_name()?.to_str());
+    let inline_path = inline
+        .map(|(path, _)| absolute_script_path(path))
+        .transpose()?;
     let mut replaced_inline = false;
     let discovered_scripts = m1_workspace::find_scripts(dir);
     check_script_count(discovered_scripts.len())?;
@@ -193,7 +211,7 @@ pub fn load_project_full_with_inline(
             continue;
         };
         let source = match inline {
-            Some((_, source)) if Some(name) == inline_name => {
+            Some((_, source)) if inline_path.as_ref() == Some(&absolute_script_path(&script)?) => {
                 replaced_inline = true;
                 Ok(source.to_string())
             }
