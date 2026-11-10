@@ -34,10 +34,10 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           # Release when the tag is absent OR the existing release is missing any
-          # of the per-platform binaries. Keying only on "release exists" meant a
+          # platform binary or its checksum manifest. Keying only on "release exists" meant a
           # release tagged before its binaries uploaded (or created by hand) could
           # never self-heal — the consumers would be left with a 404.
-          required="m1-mcp-x86_64-unknown-linux-gnu m1-mcp-aarch64-apple-darwin m1-mcp-x86_64-pc-windows-msvc.exe"
+          required="m1-mcp-x86_64-unknown-linux-gnu m1-mcp-aarch64-apple-darwin m1-mcp-x86_64-pc-windows-msvc.exe SHA256SUMS"
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             assets=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
             missing=
@@ -46,10 +46,10 @@ jobs:
             done
             if [ -n "$missing" ]; then
               echo "should_release=true" >> "$GITHUB_OUTPUT"
-              echo "Release v$VERSION exists but is missing binaries:$missing — will (re)build and upload."
+              echo "Release v$VERSION exists but is missing required assets:$missing — will (re)build and upload."
             else
               echo "should_release=false" >> "$GITHUB_OUTPUT"
-              echo "Release v$VERSION already has all binaries — nothing to do."
+              echo "Release v$VERSION already has all required assets — nothing to do."
             fi
           else
             echo "should_release=true" >> "$GITHUB_OUTPUT"
@@ -178,6 +178,7 @@ jobs:
           else
             gh release create "$TAG" out/* \
               --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
               --title "m1-mcp $TAG" \
               --notes-file body.md
           fi

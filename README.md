@@ -159,10 +159,13 @@ through the CLI directly.
 Download the binary for your platform from the
 [latest release](https://github.com/nedlane/m1-mcp/releases/latest), rename it to
 `m1-mcp` (`m1-mcp.exe` on Windows), mark it executable, and put it on your
-`PATH`. Or build from source:
+`PATH`. To update a downloaded binary, replace it with the latest release.
+With the GitHub CLI configured, build or update from the latest published tag:
 
 ```sh
-cargo install --git https://github.com/nedlane/m1-mcp --tag v0.1.0
+cargo install --git https://github.com/nedlane/m1-mcp \
+  --tag "$(gh api repos/nedlane/m1-mcp/releases/latest --jq .tag_name)" \
+  --locked --force
 ```
 
 ## Use it with Claude Code
