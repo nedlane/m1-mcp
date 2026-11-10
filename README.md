@@ -6,9 +6,9 @@ agents live access to the MoTeC **M1 script** toolchain. An agent editing
 edits — instead of guessing at builtin signatures and enum spellings, then
 shipping code it never checked.
 
-It wraps the M1 toolchain library crates (`m1-typecheck`, `m1-lint`, `m1-fmt`)
-**in-process**, so it is a single self-contained binary with no dependency on
-having the CLIs installed on your `PATH`.
+It wraps the M1 toolchain library crates (`m1-typecheck`, `m1-lint`, `m1-fmt`,
+`m1-can`) **in-process**, so it is a single self-contained binary with no
+dependency on having the CLIs installed on your `PATH`.
 
 ## Tools
 
@@ -94,7 +94,7 @@ Download the binary for your platform from the
 `PATH`. Or build from source:
 
 ```sh
-cargo install --git https://github.com/nedlane/m1-mcp --tag v0.1.0
+cargo install --git https://github.com/nedlane/m1-mcp --tag v0.7.3
 ```
 
 ## Use it with Claude Code
