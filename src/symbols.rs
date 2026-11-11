@@ -76,7 +76,7 @@ pub fn list(
 
     // Load the project fully (parameters.m1cfg + .m1dbc), so parameter types/
     // units and CAN signals are populated rather than Unknown/absent.
-    let loaded = crate::loader::load_project_full(project_path)?;
+    let loaded = crate::loader::load_project_independent(project_path)?;
     let project = loaded.project;
     let table = project.symbols();
     let total = table.len();

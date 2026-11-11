@@ -77,7 +77,11 @@ impl StdioClient {
             let line = self
                 .stdout
                 .recv_timeout(remaining)
-                .unwrap_or_else(|error| panic!("response {id} timed out: {error}"))
+                .unwrap_or_else(|error| {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    panic!("response {id} timed out: {error}")
+                })
                 .unwrap_or_else(|error| panic!("read response {id}: {error}"));
             let frame: Value = serde_json::from_str(&line)
                 .unwrap_or_else(|error| panic!("non-JSON stdout frame `{line}`: {error}"));
@@ -122,6 +126,7 @@ impl StdioClient {
             }
             if Instant::now() >= deadline {
                 self.child.kill().expect("kill hung m1-mcp");
+                self.child.wait().expect("reap hung m1-mcp");
                 panic!("m1-mcp did not exit after stdin closed");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -145,6 +150,16 @@ fn structured(response: &Value) -> Value {
     response["result"]["structuredContent"]
         .as_object()
         .unwrap_or_else(|| panic!("missing structured result: {response}"));
+    let fallback = response["result"]["content"]
+        .as_array()
+        .expect("content array")
+        .iter()
+        .find(|item| item["type"] == "text")
+        .expect("text fallback")["text"]
+        .as_str()
+        .expect("text fallback string");
+    let fallback: Value = serde_json::from_str(fallback).expect("JSON text fallback");
+    assert_eq!(fallback, response["result"]["structuredContent"]);
     response["result"]["structuredContent"].clone()
 }
 
@@ -250,6 +265,30 @@ fn stdio_protocol_exposes_tools_errors_and_clean_shutdown() {
             .contains("exactly one")
     );
 
+    let lookup = structured(&client.call(
+        9,
+        "m1_doc_lookup",
+        json!({"name":docs["matches"][0]["name"]}),
+    ));
+    assert!(lookup["count"].as_u64().is_some_and(|count| count > 0));
+    let script = dir.path().join("Test.Update.m1scr");
+    let before = std::fs::read(&script).unwrap();
+    let lint = structured(&client.call(10, "m1_lint", json!({"path":script,"fix":true})));
+    assert!(lint["diagnostics"].is_array());
+    assert_eq!(
+        std::fs::read(&script).unwrap(),
+        before,
+        "lint fix must remain read-only"
+    );
+    let rule = structured(&client.call(11, "m1_lint_rule", json!({"code":"L004"})));
+    assert_eq!(rule["code"], "L004");
+    let formatted = structured(&client.call(12, "m1_format", json!({"source":"Out=1;\n"})));
+    assert_eq!(formatted["formatted"], "Out = 1;\n");
+    let checked = structured(&client.call(13, "m1_check_project", json!({"project":project})));
+    assert_eq!(checked["load_report"]["script_count"], 1);
+    let completeness = structured(&client.call(14, "m1_completeness", json!({"project":project})));
+    assert_eq!(completeness["load_report"]["script_count"], 1);
+
     let stderr = client.finish();
     assert!(
         stderr.contains("starting m1-mcp"),
@@ -334,4 +373,53 @@ fn optional_corpus_smoke_is_read_only_across_project_tools() {
         before,
         "MCP corpus calls changed files"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn special_inputs_fail_without_blocking_later_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = write_project_fixture(dir.path());
+    let pipe = dir.path().join("Blocked.m1scr");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut client = StdioClient::start("off");
+    client.initialize();
+    let mut id = 2;
+    let mut reject = |name: &str, args: Value| {
+        let response = client.call(id, name, args);
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(response.to_string().contains("regular"), "{response}");
+        id += 1;
+        let healthy = structured(&client.call(id, "m1_format", json!({"source":"Out = 1;\n"})));
+        assert!(healthy.is_object());
+        id += 1;
+    };
+    for name in ["m1_format", "m1_lint", "m1_typecheck"] {
+        reject(name, json!({"path":pipe}));
+    }
+    for name in [
+        "m1_symbols",
+        "m1_check_project",
+        "m1_completeness",
+        "m1_can",
+    ] {
+        reject(name, json!({"project":project}));
+    }
+    reject(
+        "m1_typecheck",
+        json!({"project":project,"source":"Out = 1;\n"}),
+    );
+    let pipe_dbc = dir.path().join("Blocked.m1dbc");
+    std::fs::rename(&pipe, &pipe_dbc).unwrap();
+    reject("m1_can", json!({"project":project}));
+    let pipe_project = dir.path().join("Blocked.m1prj");
+    std::fs::rename(&pipe_dbc, &pipe_project).unwrap();
+    reject("m1_symbols", json!({"project":pipe_project}));
+    client.finish();
 }

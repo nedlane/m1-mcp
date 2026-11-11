@@ -204,10 +204,17 @@ impl Input {
             Input::Path(p) => {
                 let meta = std::fs::metadata(p)
                     .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                if !meta.is_file() {
+                    return Err(format!(
+                        "cannot read {}: expected a regular file",
+                        p.display()
+                    ));
+                }
                 if meta.len() > limits::MAX_REQUEST_SOURCE_BYTES {
                     return Err(over_limit_msg(&format!("file {}", p.display()), meta.len()));
                 }
-                let text = m1_workspace::read_text(p).map_err(|e| e.to_string())?;
+                let text = m1_workspace::read_text_capped(p, limits::MAX_REQUEST_SOURCE_BYTES)
+                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
                 Ok(ResolvedInput {
                     source: text,
                     script_path: Some(p.as_path()),

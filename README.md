@@ -35,6 +35,12 @@ project group and backing function. Lint and format use its parent directories
 for config discovery. The server never reads source from or writes to
 `context_path`; the request's `source` remains authoritative. `context_path` is
 invalid with a file `path`, which already supplies both content and context.
+Relative paths use the server's working directory. Inline replacement compares
+full logical paths with `.` and `..` normalized. The upstream project analyses
+identify scripts by basename. Semantic analyses report an explicit ambiguity
+error for two distinct paths with the same filename, including an unsaved
+context path. Symbol listing and lint/format-only project checks preserve
+both paths and remain available.
 
 ### Checking CAN
 
@@ -78,7 +84,9 @@ A malformed main `Project.m1prj` remains a tool error. A malformed auxiliary
 DBC or unreadable script does not discard the usable model: the response keeps
 the partial result and lists every skipped path with its error. Treat a result
 with skipped inputs as partial, even when its diagnostics or CAN overlaps are
-otherwise empty.
+otherwise empty. Directory traversal errors and the 64-level discovery depth
+limit return a tool error rather than claiming the omitted tree was checked.
+Descendant symlinks remain excluded from discovery.
 
 ### Analysis completeness and firmware target
 
@@ -136,19 +144,21 @@ mutate projects or write files back, and does not generate docs or
 visualisations. Use the individual CLIs (or the LSP/editor integrations) for
 those.
 
-Because the server speaks MCP over **stdio** on a single process, every request
-is bounded so no one call can monopolise it:
+The stdio server applies these input and output limits to each request:
 
-- **Inline `source` and file reads** are capped at **2 MiB** per request; a
+- **Inline `source` and direct `path` reads** are capped at **2 MiB** per request; a
   larger payload (or a `path` to a larger file, rejected on its size before it
   is read) returns a structured error naming the limit.
 - **Project-wide operations** (`m1_typecheck` given a `project`,
-  `m1_check_project`, `m1_completeness`, `m1_symbols` and `m1_can`) walk at most
-  **2000** `.m1scr` files; a larger project tree is rejected before it is
-  loaded.
+  `m1_check_project`, `m1_completeness`, `m1_symbols` and `m1_can`) reject projects with more than
+  **2000** `.m1scr` files before loading their contents. An additional unsaved
+  `context_path` counts toward the same limit.
 - **Whole-project diagnostic responses** return at most **5000** diagnostic or
   formatting-warning records. `m1_check_project` also defaults to 100 records
   per file and reports whenever either bound truncates its response.
+
+Whole-project scripts use the shared 64 MiB per-file read limit. These limits
+do not bound aggregate memory or analysis time.
 
 The limits are compile-time constants (see `src/limits.rs`), sized well above
 any realistic interactive request — a project that hits them should be run

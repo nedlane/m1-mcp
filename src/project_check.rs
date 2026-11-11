@@ -140,7 +140,11 @@ pub fn check_project(
         return Err("`checks` must contain at least one of typecheck, lint, or format".to_string());
     }
     loader::check_project_script_budget(project_path)?;
-    let loaded = loader::load_project_full(project_path)?;
+    let loaded = if options.checks.contains(&CheckKind::Typecheck) {
+        loader::load_project_full(project_path)?
+    } else {
+        loader::load_project_independent(project_path)?
+    };
     check_loaded_project(project_path, options, loaded)
 }
 
