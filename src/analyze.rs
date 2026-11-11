@@ -207,7 +207,8 @@ impl Input {
                 if meta.len() > limits::MAX_REQUEST_SOURCE_BYTES {
                     return Err(over_limit_msg(&format!("file {}", p.display()), meta.len()));
                 }
-                let text = m1_workspace::read_text(p).map_err(|e| e.to_string())?;
+                let text = m1_workspace::read_text_capped(p, limits::MAX_REQUEST_SOURCE_BYTES)
+                    .map_err(|e| e.to_string())?;
                 Ok(ResolvedInput {
                     source: text,
                     script_path: Some(p.as_path()),
