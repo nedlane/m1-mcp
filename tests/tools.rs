@@ -296,12 +296,19 @@ fn typecheck_discovers_ignore_and_ignore_symbols_for_project_findings() {
         .iter()
         .map(|diagnostic| diagnostic.code.as_str())
         .collect::<Vec<_>>();
-    for suppressed in ["T041", "T092", "T095"] {
+    assert!(!codes.contains(&"T095"), "unexpected T095: {codes:?}");
+    for (code, subject) in [("T041", "Root.Foo.Gain.Value"), ("T092", "Root.Foo.Map")] {
         assert!(
-            !codes.contains(&suppressed),
-            "unexpected {suppressed}: {codes:?}"
+            !out.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == code && diagnostic.subject.as_deref() == Some(subject)
+            }),
+            "suppressed {code} for {subject} remains: {out:?}"
         );
     }
+    // A symbol-scoped suppression must preserve findings on other objects.
+    assert!(out.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "T092" && diagnostic.subject.as_deref() != Some("Root.Foo.Map")
+    }));
     assert!(
         codes.contains(&"T111"),
         "unrelated finding missing: {codes:?}"
